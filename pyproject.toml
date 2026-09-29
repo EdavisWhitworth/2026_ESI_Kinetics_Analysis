@@ -9,6 +9,7 @@ description = "GUI-assisted scientific image summation and brightness analysis"
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26",
+  "scipy>=1.11",
   "Pillow>=10.0",
   "pandas>=2.0",
   "PySide6>=6.6",

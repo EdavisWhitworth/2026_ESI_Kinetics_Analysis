@@ -34,6 +34,13 @@ class PipelineSettings:
     enable_combine: bool = True
     enable_crop: bool = False
     enable_background: bool = True
+    enable_connected_region: bool = True
+    region_mask: np.ndarray | None = None
+    background_mask: np.ndarray | None = None
+    enable_spatial_background: bool = False
+    reference_background: np.ndarray | None = None
+    enable_reference_background: bool = False
+    zero_outside_crop: bool = False
 
 
 @dataclass(frozen=True)
@@ -43,6 +50,7 @@ class StageResult:
     brightness: float
     active_pixels: int
     maximum: float
+    mean_intensity: float
     settings: PipelineSettings
 
 
