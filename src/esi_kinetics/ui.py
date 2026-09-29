@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QRect, Qt, Signal
+from PySide6.QtCore import QRect, Qt, QThread, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout,
@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 
 from .io import (
     export_results,
+    extract_video_frames,
     load_experiment,
     load_reference_profile,
     save_reference_profile,
@@ -23,6 +24,23 @@ from .processing import (
     estimate_reference_background,
     process_image,
 )
+
+
+class VideoExtractionWorker(QThread):
+    extractionComplete = Signal(str, int)
+    extractionFailed = Signal(str)
+
+    def __init__(self, video_path: Path, output_folder: Path) -> None:
+        super().__init__()
+        self.video_path = video_path
+        self.output_folder = output_folder
+
+    def run(self) -> None:
+        try:
+            frames = extract_video_frames(self.video_path, self.output_folder, frame_count=100)
+            self.extractionComplete.emit(str(self.output_folder), len(frames))
+        except Exception as error:
+            self.extractionFailed.emit(str(error))
 
 
 class ImagePreview(QWidget):
@@ -222,6 +240,7 @@ class MainWindow(QMainWindow):
         self.results = []
         self.reference_signal_mask = None
         self.reference_background = None
+        self._video_worker = None
         self._crop_view_origin = (0, 0)
         self._preview_stage = None
         self._segment_scan_key = None
@@ -284,6 +303,9 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         import_button = QPushButton("Import image folder")
         import_button.clicked.connect(self.import_folder)
+        import_video_button = QPushButton("Import video (extract 100 frames)")
+        import_video_button.clicked.connect(self.import_video)
+        self.import_video_button = import_video_button
         export_button = QPushButton("Export results")
         export_button.clicked.connect(self.export)
         reset_button = QPushButton("Reset processing")
@@ -294,6 +316,7 @@ class MainWindow(QMainWindow):
         load_profile_button.clicked.connect(self.load_profile)
         controls = QFormLayout()
         controls.addRow(import_button)
+        controls.addRow(import_video_button)
         controls.addRow("Stage", self.stage_selector)
         controls.addRow(self.combine_enabled)
         controls.addRow(self.crop_enabled)
@@ -353,6 +376,46 @@ class MainWindow(QMainWindow):
         if not folder:
             return
         self._load_folder(Path(folder))
+
+    def import_video(self) -> None:
+        video_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select video to extract",
+            "",
+            "Video files (*.mp4 *.mov *.avi *.mkv *.webm *.mpeg *.mpg *.m4v *.wmv);;All files (*)",
+        )
+        if not video_path:
+            return
+        output_folder = QFileDialog.getExistingDirectory(
+            self, "Select an empty folder for the 100 extracted stages"
+        )
+        if not output_folder:
+            return
+        try:
+            self.import_video_button.setEnabled(False)
+            self.summary.setText("Extracting 100 evenly spaced video frames...")
+            self._video_worker = VideoExtractionWorker(Path(video_path), Path(output_folder))
+            self._video_worker.extractionComplete.connect(self._video_extraction_complete)
+            self._video_worker.extractionFailed.connect(self._video_extraction_failed)
+            self._video_worker.start()
+        except (OSError, ValueError, RuntimeError) as error:
+            self.import_video_button.setEnabled(True)
+            QMessageBox.critical(self, "Video import failed", str(error))
+
+    def _video_extraction_complete(self, output_folder: str, frame_count: int) -> None:
+        self._load_folder(Path(output_folder))
+        QMessageBox.information(
+            self,
+            "Video extraction complete",
+            f"Extracted {frame_count} evenly spaced frames, including the first and last frame.\n"
+            f"Each frame is available as a separate stage in:\n{output_folder}",
+        )
+        self.import_video_button.setEnabled(True)
+
+    def _video_extraction_failed(self, message: str) -> None:
+        self.summary.setText("Video extraction failed")
+        self.import_video_button.setEnabled(True)
+        QMessageBox.critical(self, "Video import failed", message)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if any(url.isLocalFile() and Path(url.toLocalFile()).is_dir()

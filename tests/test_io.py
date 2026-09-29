@@ -8,6 +8,7 @@ from PIL import Image
 from esi_kinetics.io import (
     discover_stages,
     export_results,
+    extract_video_frames,
     load_experiment,
     load_reference_profile,
     save_reference_profile,
@@ -16,12 +17,42 @@ from esi_kinetics.models import Crop, PipelineSettings
 from esi_kinetics.processing import process_image
 
 
+def _write_test_video(path: Path, frame_count: int = 12) -> None:
+    import imageio_ffmpeg
+
+    writer = imageio_ffmpeg.write_frames(
+        str(path),
+        size=(8, 6),
+        fps=6,
+        codec="mpeg4",
+        macro_block_size=1,
+    )
+    writer.send(None)
+    for frame_index in range(frame_count):
+        frame = np.full((6, 8, 3), frame_index * 15, dtype=np.uint8)
+        writer.send(frame)
+    writer.close()
+
+
 def test_discover_stages_from_filenames(tmp_path: Path):
     for name in ["sample_stage_02_a.png", "sample_stage_01_a.png", "sample_stage_02_b.png"]:
         Image.fromarray(np.ones((2, 2), dtype=np.uint8)).save(tmp_path / name)
     stages = discover_stages(tmp_path)
     assert [stage.name for stage in stages] == ["Stage 01", "Stage 02"]
     assert len(stages[1].paths) == 2
+
+
+def test_discover_stages_sorts_three_digit_video_stages_numerically(tmp_path: Path):
+    for index in (100, 11, 2, 99, 10):
+        Image.fromarray(np.full((2, 2), index, dtype=np.uint8)).save(
+            tmp_path / f"stage_{index:03d}.png"
+        )
+
+    stages = discover_stages(tmp_path)
+
+    assert [stage.name for stage in stages] == [
+        "Stage 02", "Stage 10", "Stage 11", "Stage 99", "Stage 100"
+    ]
 
 
 def test_load_experiment_combines_each_stage(tmp_path: Path):
@@ -72,6 +103,37 @@ def test_exported_box_mask_tiff_keeps_full_dimensions(tmp_path: Path):
     assert np.all(exported_image[:, :2] == 0)
     assert np.all(exported_image[:, 5:] == 0)
     np.testing.assert_array_equal(exported_image[1:4, 2:5], image[1:4, 2:5])
+
+
+def test_extract_video_frames_samples_evenly_and_creates_stages(tmp_path: Path):
+    video_path = tmp_path / "test_video.mp4"
+    output_folder = tmp_path / "extracted"
+    _write_test_video(video_path)
+
+    output_paths = extract_video_frames(video_path, output_folder)
+    experiment = load_experiment(output_folder)
+
+    assert len(output_paths) == 100
+    assert output_paths[0].name == "stage_001.png"
+    assert output_paths[-1].name == "stage_100.png"
+    assert len(experiment.stages) == 100
+    assert experiment.stages[0].name == "Stage 01"
+    assert experiment.stages[-1].name == "Stage 100"
+    assert all(image.shape == (6, 8) for image in experiment.combined.values())
+    assert experiment.combined["Stage 01"].mean() < experiment.combined["Stage 100"].mean()
+
+
+def test_extract_video_frames_rejects_nonempty_destination(tmp_path: Path):
+    video_path = tmp_path / "test_video.mp4"
+    output_folder = tmp_path / "extracted"
+    _write_test_video(video_path)
+    output_folder.mkdir()
+    (output_folder / "keep.txt").write_text("untouched")
+
+    with pytest.raises(ValueError, match="empty folder"):
+        extract_video_frames(video_path, output_folder, frame_count=5)
+
+    assert (output_folder / "keep.txt").read_text() == "untouched"
 
 
 def test_reference_profile_round_trips_masks(tmp_path: Path):

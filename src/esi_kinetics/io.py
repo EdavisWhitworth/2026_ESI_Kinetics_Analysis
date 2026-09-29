@@ -3,6 +3,7 @@ from pathlib import Path
 import re
 
 import numpy as np
+import imageio_ffmpeg
 import pandas as pd
 from PIL import Image
 
@@ -31,7 +32,13 @@ def discover_stages(folder: Path) -> list[Stage]:
     for path in sorted(folder.iterdir()):
         if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES:
             grouped[stage_key(path)].append(path)
-    return [Stage(name, tuple(paths)) for name, paths in sorted(grouped.items())]
+    return [
+        Stage(name, tuple(paths))
+        for name, paths in sorted(
+            grouped.items(),
+            key=lambda item: int(re.search(r"\d+", item[0]).group()),
+        )
+    ]
 
 
 def read_image(path: Path) -> np.ndarray:
@@ -47,6 +54,48 @@ def load_experiment(folder: Path) -> Experiment:
     for stage in stages:
         experiment.combined[stage.name] = combine_frames([read_image(path) for path in stage.paths])
     return experiment
+
+
+def extract_video_frames(video_path: Path, output_folder: Path, frame_count: int = 100) -> list[Path]:
+    if frame_count < 1:
+        raise ValueError("Frame count must be at least one")
+    if not video_path.is_file():
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+    output_folder.mkdir(parents=True, exist_ok=True)
+    if any(output_folder.iterdir()):
+        raise ValueError("Choose an empty folder for extracted video frames")
+
+    total_frames, _ = imageio_ffmpeg.count_frames_and_secs(str(video_path))
+    if total_frames < 1:
+        raise ValueError("The selected video contains no readable frames")
+    sample_indices = np.rint(np.linspace(0, total_frames - 1, frame_count)).astype(np.int64)
+    output_paths = [output_folder / f"stage_{index + 1:03d}.png" for index in range(frame_count)]
+    written_paths: list[Path] = []
+    reader = imageio_ffmpeg.read_frames(str(video_path), pix_fmt="rgb24")
+    try:
+        metadata = next(reader)
+        width, height = metadata["size"]
+        sample_number = 0
+        for frame_index, frame_bytes in enumerate(reader):
+            while sample_number < frame_count and sample_indices[sample_number] == frame_index:
+                frame = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(height, width, 3)
+                output_path = output_paths[sample_number]
+                Image.fromarray(frame).convert("L").save(output_path)
+                written_paths.append(output_path)
+                sample_number += 1
+            if sample_number == frame_count:
+                break
+        if sample_number != frame_count:
+            raise ValueError(
+                f"Video decoding yielded only {sample_number} of {frame_count} requested frames"
+            )
+    except Exception:
+        for output_path in written_paths:
+            output_path.unlink(missing_ok=True)
+        raise
+    finally:
+        reader.close()
+    return output_paths
 
 
 def save_reference_profile(signal_mask: np.ndarray, background_reference: np.ndarray, path: Path) -> Path:
