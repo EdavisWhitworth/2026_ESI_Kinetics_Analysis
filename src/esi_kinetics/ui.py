@@ -407,8 +407,8 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Video extraction complete",
-            f"Extracted {frame_count} evenly spaced frames, including the first and last frame.\n"
-            f"Each frame is available as a separate stage in:\n{output_folder}",
+            f"Kept {frame_count} evenly spaced frames with brighter average intensity.\n"
+            f"Each kept frame is available as a separate stage in:\n{output_folder}",
         )
         self.import_video_button.setEnabled(True)
 
@@ -743,7 +743,11 @@ class MainWindow(QMainWindow):
             results = [process_image(stage.name, self.experiment.combined[stage.name], self.settings())
                        for stage in self.experiment.stages]
             export_results(results, Path(folder))
-            QMessageBox.information(self, "Export complete", "Processed images and brightness_summary.csv were exported.")
+            QMessageBox.information(
+                self,
+                "Export complete",
+                "Processed images, brightness_summary.csv, and mean_intensity_average.csv were exported.",
+            )
 
 
 def run() -> None:

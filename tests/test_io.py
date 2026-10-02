@@ -34,6 +34,19 @@ def _write_test_video(path: Path, frame_count: int = 12) -> None:
     writer.close()
 
 
+def _write_on_off_video(path: Path) -> None:
+    import imageio_ffmpeg
+
+    writer = imageio_ffmpeg.write_frames(
+        str(path), size=(8, 6), fps=6, codec="mpeg4", macro_block_size=1
+    )
+    writer.send(None)
+    for frame_index in range(12):
+        brightness = 0 if frame_index < 6 else 120
+        writer.send(np.full((6, 8, 3), brightness, dtype=np.uint8))
+    writer.close()
+
+
 def test_discover_stages_from_filenames(tmp_path: Path):
     for name in ["sample_stage_02_a.png", "sample_stage_01_a.png", "sample_stage_02_b.png"]:
         Image.fromarray(np.ones((2, 2), dtype=np.uint8)).save(tmp_path / name)
@@ -63,8 +76,11 @@ def test_load_experiment_combines_each_stage(tmp_path: Path):
 
 
 def test_export_results_uses_explicit_metric_column_names(tmp_path: Path):
-    result = process_image("Stage 01", np.array([[0, 12], [8, 0]], dtype=np.float64), PipelineSettings())
-    csv_path = export_results([result], tmp_path)
+    results = [
+        process_image("Stage 01", np.array([[0, 12], [8, 0]], dtype=np.float64), PipelineSettings()),
+        process_image("Stage 02", np.array([[0, 18], [12, 0]], dtype=np.float64), PipelineSettings()),
+    ]
+    csv_path = export_results(results, tmp_path)
     exported = pd.read_csv(csv_path)
 
     assert exported.columns.tolist() == [
@@ -78,6 +94,12 @@ def test_export_results_uses_explicit_metric_column_names(tmp_path: Path):
     assert exported.loc[0, "Integrated_Brightness"] == 20
     assert exported.loc[0, "Mean_Intensity"] == 10
     assert exported.loc[0, "Background_Correction"] == "threshold"
+    average = pd.read_csv(tmp_path / "mean_intensity_average.csv")
+    assert average.columns.tolist() == ["Average_Mean_Intensity"]
+    assert len(average) == 1
+    assert average.loc[0, "Average_Mean_Intensity"] == np.mean(
+        exported["Mean_Intensity"]
+    )
 
 
 def test_exported_box_mask_tiff_keeps_full_dimensions(tmp_path: Path):
@@ -121,6 +143,18 @@ def test_extract_video_frames_samples_evenly_and_creates_stages(tmp_path: Path):
     assert experiment.stages[-1].name == "Stage 100"
     assert all(image.shape == (6, 8) for image in experiment.combined.values())
     assert experiment.combined["Stage 01"].mean() < experiment.combined["Stage 100"].mean()
+
+
+def test_extract_video_frames_discards_dimmer_group(tmp_path: Path):
+    video_path = tmp_path / "on_off_video.mp4"
+    output_folder = tmp_path / "extracted"
+    _write_on_off_video(video_path)
+
+    output_paths = extract_video_frames(video_path, output_folder, frame_count=12)
+
+    assert len(output_paths) == 6
+    assert all(int(path.stem.split("_")[1]) >= 7 for path in output_paths)
+    assert all(np.asarray(Image.open(path)).mean() > 100 for path in output_paths)
 
 
 def test_extract_video_frames_rejects_nonempty_destination(tmp_path: Path):
