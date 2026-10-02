@@ -7,8 +7,11 @@ from PIL import Image
 
 from esi_kinetics.io import (
     discover_stages,
+    analyze_delay_folders,
+    export_delay_analysis,
     _bright_frame_indices,
     export_results,
+    extract_video_batch,
     extract_video_frames,
     load_experiment,
     load_reference_profile,
@@ -76,6 +79,40 @@ def test_bright_frame_selection_keeps_only_values_above_the_mean():
 
 def test_bright_frame_selection_keeps_uniform_video_frames():
     assert _bright_frame_indices([42.0, 42.0, 42.0]) == [0, 1, 2]
+
+
+def test_delay_folder_analysis_subtracts_shared_background_and_exports_chart(tmp_path: Path):
+    parent = tmp_path / "delays"
+    early_folder = parent / "2 ms delay"
+    late_folder = parent / "500 us delay"
+    early_folder.mkdir(parents=True)
+    late_folder.mkdir()
+    Image.fromarray(np.array([[12, 8], [0, 0]], dtype=np.uint8)).save(early_folder / "a.png")
+    Image.fromarray(np.array([[20, 12], [0, 0]], dtype=np.uint8)).save(early_folder / "b.png")
+    Image.fromarray(np.array([[10, 10], [0, 0]], dtype=np.uint8)).save(late_folder / "a.png")
+    background = np.array([[2, 2], [2, 2]], dtype=np.float64)
+
+    rows = analyze_delay_folders(parent, background)
+
+    assert [row["Time_Delay"] for row in rows] == [0.0005, 0.002]
+    assert rows[0]["Mean_Intensity"] == 8.0
+    assert rows[0]["Images_Averaged"] == 1
+    assert rows[1]["Mean_Intensity"] == 11.0
+    workbook_path = export_delay_analysis(rows, tmp_path / "results.xlsx")
+
+    import zipfile
+
+    with zipfile.ZipFile(workbook_path) as workbook:
+        assert "xl/charts/chart1.xml" in workbook.namelist()
+        shared_strings = workbook.read("xl/sharedStrings.xml").decode("utf-8")
+        assert "Mean_Intensity" in shared_strings
+
+
+def test_parse_time_delay_requires_unit():
+    from esi_kinetics.io import parse_time_delay
+
+    with pytest.raises(ValueError, match="delay value and unit"):
+        parse_time_delay("early delay")
 
 
 def test_discover_stages_sorts_three_digit_video_stages_numerically(tmp_path: Path):
@@ -176,6 +213,27 @@ def test_extract_video_frames_discards_dimmer_group(tmp_path: Path):
     assert len(output_paths) == 6
     assert all(int(path.stem.split("_")[1]) >= 7 for path in output_paths)
     assert all(np.asarray(Image.open(path)).mean() > 100 for path in output_paths)
+
+
+def test_extract_video_batch_creates_sibling_folders_for_all_videos(tmp_path: Path):
+    first_video = tmp_path / "sample_500us.mp4"
+    second_video = tmp_path / "sample_2ms.mp4"
+    _write_test_video(first_video)
+    _write_on_off_video(second_video)
+    progress = []
+
+    completed, failures = extract_video_batch(
+        [first_video, second_video],
+        frame_count=12,
+        progress_callback=lambda path, index, total: progress.append((path.name, index, total)),
+    )
+
+    assert failures == []
+    assert [folder.name for folder, _ in completed] == [
+        "sample_500us Frames", "sample_2ms Frames"
+    ]
+    assert all(count > 0 for _, count in completed)
+    assert progress == [(first_video.name, 1, 2), (second_video.name, 2, 2)]
 
 
 def test_extract_video_frames_rejects_nonempty_destination(tmp_path: Path):

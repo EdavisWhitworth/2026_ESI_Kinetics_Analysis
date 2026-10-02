@@ -12,11 +12,12 @@ from PySide6.QtWidgets import (
 
 from .io import (
     export_results,
-    extract_video_frames,
+    analyze_delay_folders,
+    export_delay_analysis,
+    extract_video_batch,
     load_experiment,
     load_reference_profile,
     save_reference_profile,
-    video_frames_folder,
 )
 from .models import Crop, PipelineSettings
 from .processing import (
@@ -29,21 +30,42 @@ from .processing import (
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpeg", ".mpg", ".m4v", ".wmv"}
 
 
-class VideoExtractionWorker(QThread):
-    extractionComplete = Signal(str, int)
-    extractionFailed = Signal(str)
+class DelayAnalysisWorker(QThread):
+    analysisComplete = Signal(str, int)
+    analysisFailed = Signal(str)
 
-    def __init__(self, video_path: Path, output_folder: Path) -> None:
+    def __init__(self, parent_folder: Path, background_reference: np.ndarray, workbook_path: Path) -> None:
         super().__init__()
-        self.video_path = video_path
-        self.output_folder = output_folder
+        self.parent_folder = parent_folder
+        self.background_reference = background_reference.copy()
+        self.workbook_path = workbook_path
 
     def run(self) -> None:
         try:
-            frames = extract_video_frames(self.video_path, self.output_folder, frame_count=100)
-            self.extractionComplete.emit(str(self.output_folder), len(frames))
+            rows = analyze_delay_folders(self.parent_folder, self.background_reference)
+            export_delay_analysis(rows, self.workbook_path)
+            self.analysisComplete.emit(str(self.workbook_path), len(rows))
         except Exception as error:
-            self.extractionFailed.emit(str(error))
+            self.analysisFailed.emit(str(error))
+
+
+class VideoExtractionWorker(QThread):
+    progress = Signal(str, int, int)
+    extractionComplete = Signal(object)
+
+    def __init__(self, video_paths: list[Path]) -> None:
+        super().__init__()
+        self.video_paths = video_paths
+
+    def run(self) -> None:
+        results, failures = extract_video_batch(
+            self.video_paths,
+            frame_count=100,
+            progress_callback=lambda path, index, total: self.progress.emit(
+                path.name, index, total
+            ),
+        )
+        self.extractionComplete.emit((results, failures))
 
 
 class ImagePreview(QWidget):
@@ -244,6 +266,7 @@ class MainWindow(QMainWindow):
         self.reference_signal_mask = None
         self.reference_background = None
         self._video_worker = None
+        self._delay_analysis_worker = None
         self._crop_view_origin = (0, 0)
         self._preview_stage = None
         self._segment_scan_key = None
@@ -306,9 +329,12 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         import_button = QPushButton("Import image folder")
         import_button.clicked.connect(self.import_folder)
-        import_video_button = QPushButton("Import video (extract 100 frames)")
+        import_video_button = QPushButton("Import videos (select multiple)")
         import_video_button.clicked.connect(self.import_video)
         self.import_video_button = import_video_button
+        batch_analysis_button = QPushButton("Analyze delay folders")
+        batch_analysis_button.clicked.connect(self.analyze_delay_folders)
+        self.batch_analysis_button = batch_analysis_button
         export_button = QPushButton("Export results")
         export_button.clicked.connect(self.export)
         reset_button = QPushButton("Reset processing")
@@ -320,6 +346,7 @@ class MainWindow(QMainWindow):
         controls = QFormLayout()
         controls.addRow(import_button)
         controls.addRow(import_video_button)
+        controls.addRow(batch_analysis_button)
         controls.addRow("Stage", self.stage_selector)
         controls.addRow(self.combine_enabled)
         controls.addRow(self.crop_enabled)
@@ -381,44 +408,103 @@ class MainWindow(QMainWindow):
         self._load_folder(Path(folder))
 
     def import_video(self) -> None:
-        video_path, _ = QFileDialog.getOpenFileName(
+        video_paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Select video to extract",
+            "Select videos to extract",
             "",
             "Video files (*.mp4 *.mov *.avi *.mkv *.webm *.mpeg *.mpg *.m4v *.wmv);;All files (*)",
         )
-        if not video_path:
+        if not video_paths:
             return
 
-        self._start_video_import(Path(video_path))
+        self._start_video_import([Path(video_path) for video_path in video_paths])
 
-    def _start_video_import(self, video_path: Path) -> None:
+    def analyze_delay_folders(self) -> None:
+        if self.reference_background is None:
+            QMessageBox.information(
+                self,
+                "Load background first",
+                "Load the saved background image before starting batch delay analysis.",
+            )
+            return
+        parent_folder = QFileDialog.getExistingDirectory(
+            self, "Select the folder containing all delay image folders"
+        )
+        if not parent_folder:
+            return
+        default_path = str(Path(parent_folder) / "delay_mean_intensity.xlsx")
+        workbook_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save time delay vs mean intensity workbook",
+            default_path,
+            "Excel workbook (*.xlsx)",
+        )
+        if not workbook_path:
+            return
+        output_path = Path(workbook_path)
+        if output_path.suffix.lower() != ".xlsx":
+            output_path = output_path.with_suffix(".xlsx")
         try:
-            output_folder = video_frames_folder(video_path)
+            self.batch_analysis_button.setEnabled(False)
+            self.summary.setText("Analyzing delay folders with the loaded background...")
+            self._delay_analysis_worker = DelayAnalysisWorker(
+                Path(parent_folder), self.reference_background, output_path
+            )
+            self._delay_analysis_worker.analysisComplete.connect(self._delay_analysis_complete)
+            self._delay_analysis_worker.analysisFailed.connect(self._delay_analysis_failed)
+            self._delay_analysis_worker.start()
+        except (OSError, ValueError, RuntimeError) as error:
+            self.batch_analysis_button.setEnabled(True)
+            QMessageBox.critical(self, "Batch analysis failed", str(error))
+
+    def _delay_analysis_complete(self, workbook_path: str, delay_count: int) -> None:
+        self.summary.setText(f"Batch analysis complete: {delay_count} time delays.")
+        self.batch_analysis_button.setEnabled(True)
+        QMessageBox.information(
+            self,
+            "Batch analysis complete",
+            f"Analyzed {delay_count} delay folders and saved the workbook to:\n{workbook_path}",
+        )
+
+    def _delay_analysis_failed(self, message: str) -> None:
+        self.summary.setText("Batch analysis failed")
+        self.batch_analysis_button.setEnabled(True)
+        QMessageBox.critical(self, "Batch analysis failed", message)
+
+    def _start_video_import(self, video_paths: list[Path]) -> None:
+        try:
             self.import_video_button.setEnabled(False)
-            self.summary.setText("Extracting and filtering 100 evenly spaced video frames...")
-            self._video_worker = VideoExtractionWorker(video_path, output_folder)
+            self.summary.setText(f"Preparing {len(video_paths)} videos for frame extraction...")
+            self._video_worker = VideoExtractionWorker(video_paths)
+            self._video_worker.progress.connect(self._video_extraction_progress)
             self._video_worker.extractionComplete.connect(self._video_extraction_complete)
-            self._video_worker.extractionFailed.connect(self._video_extraction_failed)
             self._video_worker.start()
         except (OSError, ValueError, RuntimeError) as error:
             self.import_video_button.setEnabled(True)
             QMessageBox.critical(self, "Video import failed", str(error))
 
-    def _video_extraction_complete(self, output_folder: str, frame_count: int) -> None:
-        self._load_folder(Path(output_folder))
-        QMessageBox.information(
-            self,
-            "Video extraction complete",
-            f"Kept {frame_count} of 100 sampled frames with brighter average intensity.\n"
-            f"Each kept frame is available as a separate stage in:\n{output_folder}",
-        )
-        self.import_video_button.setEnabled(True)
+    def _video_extraction_progress(self, video_name: str, index: int, total: int) -> None:
+        self.summary.setText(f"Processing video {index} of {total}: {video_name}")
 
-    def _video_extraction_failed(self, message: str) -> None:
-        self.summary.setText("Video extraction failed")
+    def _video_extraction_complete(
+        self, outcome: tuple[list[tuple[Path, int]], list[str]]
+    ) -> None:
+        results, failures = outcome
         self.import_video_button.setEnabled(True)
-        QMessageBox.critical(self, "Video import failed", message)
+        if len(results) == 1 and not failures:
+            self._load_folder(results[0][0])
+        completed_text = "\n".join(
+            f"{folder}: kept {count} of 100 frames" for folder, count in results
+        )
+        failure_text = "\n".join(failures)
+        self.summary.setText(
+            f"Video extraction complete: {len(results)} succeeded, {len(failures)} failed."
+        )
+        title = "Video extraction complete" if not failures else "Video extraction finished with errors"
+        message = completed_text or "No videos were processed successfully."
+        if failure_text:
+            message += f"\n\nFailed videos:\n{failure_text}"
+        QMessageBox.information(self, title, message)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if any(
@@ -440,11 +526,14 @@ class MainWindow(QMainWindow):
             if url.isLocalFile()
         ]
         folders = [path for path in paths if path.is_dir()]
-        videos = [path for path in paths if path.suffix.lower() in VIDEO_SUFFIXES]
-        if folders:
+        videos = [
+            path for path in paths
+            if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES
+        ]
+        if videos:
+            self._start_video_import(videos)
+        elif folders:
             self._load_folder(folders[0])
-        elif videos:
-            self._start_video_import(videos[0])
         else:
             event.ignore()
             return

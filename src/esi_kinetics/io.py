@@ -1,4 +1,5 @@
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 import re
 from tempfile import TemporaryDirectory
@@ -6,12 +7,27 @@ from tempfile import TemporaryDirectory
 import numpy as np
 import imageio_ffmpeg
 import pandas as pd
+import xlsxwriter
 from PIL import Image
 
-from .models import Experiment, Stage, StageResult
-from .processing import combine_frames
+from .models import Experiment, PipelineSettings, Stage, StageResult
+from .processing import combine_frames, process_image
 
 SUPPORTED_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+DELAY_PATTERN = re.compile(
+    r"(?<![\w.])(\d+(?:\.\d+)?(?:e[+-]?\d+)?)\s*(fs|ps|ns|us|µs|μs|ms|s)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+DELAY_TO_SECONDS = {
+    "fs": 1e-15,
+    "ps": 1e-12,
+    "ns": 1e-9,
+    "us": 1e-6,
+    "µs": 1e-6,
+    "μs": 1e-6,
+    "ms": 1e-3,
+    "s": 1.0,
+}
 
 
 def _validate_reference_profile(signal_mask: np.ndarray, background_reference: np.ndarray) -> None:
@@ -67,6 +83,101 @@ def video_frames_folder(video_path: Path) -> Path:
         candidate = base_folder.with_name(f"{base_folder.name} ({suffix})")
         suffix += 1
     return candidate
+
+
+def parse_time_delay(folder_name: str) -> tuple[float, str]:
+    match = DELAY_PATTERN.search(folder_name)
+    if match is None:
+        raise ValueError(
+            f"Folder name '{folder_name}' must include a delay value and unit, such as '2 ms'."
+        )
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    if not np.isfinite(value):
+        raise ValueError(f"Folder name '{folder_name}' contains an invalid time delay.")
+    return value * DELAY_TO_SECONDS[unit], unit
+
+
+def analyze_delay_folders(parent_folder: Path, background_reference: np.ndarray) -> list[dict[str, object]]:
+    if background_reference.ndim != 2 or not np.all(np.isfinite(background_reference)):
+        raise ValueError("The loaded background reference must be a finite 2D image.")
+
+    rows: list[dict[str, object]] = []
+    for folder in parent_folder.iterdir():
+        if not folder.is_dir():
+            continue
+        image_paths = sorted(
+            path for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
+        )
+        if not image_paths:
+            continue
+        delay_seconds, delay_unit = parse_time_delay(folder.name)
+        frame_means = []
+        for image_path in image_paths:
+            image = read_image(image_path)
+            if image.shape != background_reference.shape:
+                raise ValueError(
+                    f"Image dimensions in '{folder.name}' do not match the loaded background."
+                )
+            result = process_image(
+                image_path.name,
+                image,
+                PipelineSettings(
+                    enable_background=False,
+                    enable_connected_region=False,
+                    reference_background=background_reference,
+                    enable_reference_background=True,
+                ),
+            )
+            frame_means.append(result.mean_intensity)
+        rows.append({
+            "Folder": folder.name,
+            "Time_Delay": delay_seconds,
+            "Time_Unit_In_Title": delay_unit,
+            "Mean_Intensity": float(np.mean(frame_means, dtype=np.float64)),
+            "Images_Averaged": len(frame_means),
+        })
+
+    if not rows:
+        raise ValueError("No image folders were found in the selected parent folder.")
+    return sorted(rows, key=lambda row: float(row["Time_Delay"]))
+
+
+def export_delay_analysis(rows: list[dict[str, object]], workbook_path: Path) -> Path:
+    if not rows:
+        raise ValueError("There are no delay results to export.")
+    workbook_path.parent.mkdir(parents=True, exist_ok=True)
+    columns = [
+        "Folder", "Time_Delay_s", "Time_Unit_In_Title", "Mean_Intensity", "Images_Averaged"
+    ]
+    with pd.ExcelWriter(workbook_path, engine="xlsxwriter") as writer:
+        dataframe = pd.DataFrame(rows, columns=columns)
+        dataframe.to_excel(writer, sheet_name="Mean Intensity", index=False)
+        worksheet = writer.sheets["Mean Intensity"]
+        worksheet.freeze_panes(1, 0)
+        worksheet.set_column("A:A", 28)
+        worksheet.set_column("B:B", 16)
+        worksheet.set_column("C:C", 20)
+        worksheet.set_column("D:D", 20)
+        worksheet.set_column("E:E", 18)
+        worksheet.autofilter(0, 0, len(rows), len(columns) - 1)
+
+        chart = writer.book.add_chart({"type": "scatter", "subtype": "straight_with_markers"})
+        chart.add_series({
+            "name": "Mean Intensity",
+            "categories": ["Mean Intensity", 1, 1, len(rows), 1],
+            "values": ["Mean Intensity", 1, 3, len(rows), 3],
+            "marker": {"type": "circle", "size": 6},
+            "line": {"none": True},
+        })
+        chart.set_title({"name": "Mean Intensity vs Time Delay"})
+        chart.set_x_axis({"name": "Time Delay (s)", "num_format": "0.#######"})
+        chart.set_y_axis({"name": "Mean Intensity"})
+        chart.set_legend({"none": True})
+        chart.set_size({"width": 760, "height": 440})
+        worksheet.insert_chart("G2", chart)
+    return workbook_path
 
 
 def _bright_frame_indices(brightness: list[float]) -> list[int]:
@@ -126,6 +237,25 @@ def extract_video_frames(video_path: Path, output_folder: Path, frame_count: int
             temporary_paths[index].replace(output_paths[index])
             selected_paths.append(output_paths[index])
     return selected_paths
+
+
+def extract_video_batch(
+    video_paths: list[Path],
+    frame_count: int = 100,
+    progress_callback: Callable[[Path, int, int], None] | None = None,
+) -> tuple[list[tuple[Path, int]], list[str]]:
+    completed: list[tuple[Path, int]] = []
+    failures: list[str] = []
+    for index, video_path in enumerate(video_paths, start=1):
+        if progress_callback is not None:
+            progress_callback(video_path, index, len(video_paths))
+        try:
+            output_folder = video_frames_folder(video_path)
+            frames = extract_video_frames(video_path, output_folder, frame_count)
+            completed.append((output_folder, len(frames)))
+        except Exception as error:
+            failures.append(f"{video_path.name}: {error}")
+    return completed, failures
 
 
 def save_reference_profile(signal_mask: np.ndarray, background_reference: np.ndarray, path: Path) -> Path:
