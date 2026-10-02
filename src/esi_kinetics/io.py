@@ -57,23 +57,26 @@ def load_experiment(folder: Path) -> Experiment:
     return experiment
 
 
+def video_frames_folder(video_path: Path) -> Path:
+    base_folder = video_path.with_name(f"{video_path.stem} Frames")
+    candidate = base_folder
+    suffix = 2
+    while candidate.exists() and (
+        not candidate.is_dir() or any(candidate.iterdir())
+    ):
+        candidate = base_folder.with_name(f"{base_folder.name} ({suffix})")
+        suffix += 1
+    return candidate
+
+
 def _bright_frame_indices(brightness: list[float]) -> list[int]:
     values = np.asarray(brightness, dtype=np.float64)
-    unique_levels = np.unique(values)
-    if unique_levels.size < 2:
+    if values.size < 2 or np.all(values == values[0]):
         return list(range(values.size))
 
-    level_gaps = np.diff(unique_levels)
-    largest_gap_index = int(np.argmax(level_gaps))
-    largest_gap = float(level_gaps[largest_gap_index])
-    remaining_gaps = np.delete(level_gaps, largest_gap_index)
-    typical_gap = float(np.median(remaining_gaps)) if remaining_gaps.size else 0.0
-    brightness_range = float(unique_levels[-1] - unique_levels[0])
-    if largest_gap < max(1.0, 3.0 * typical_gap, 0.05 * brightness_range):
-        return list(range(values.size))
-
-    cutoff = (unique_levels[largest_gap_index] + unique_levels[largest_gap_index + 1]) / 2.0
-    return np.flatnonzero(values > cutoff).tolist()
+    average_brightness = float(np.mean(values, dtype=np.float64))
+    selected = np.flatnonzero(values > average_brightness).tolist()
+    return selected or list(range(values.size))
 
 
 def extract_video_frames(video_path: Path, output_folder: Path, frame_count: int = 100) -> list[Path]:

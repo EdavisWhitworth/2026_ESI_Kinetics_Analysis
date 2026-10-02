@@ -16,6 +16,7 @@ from .io import (
     load_experiment,
     load_reference_profile,
     save_reference_profile,
+    video_frames_folder,
 )
 from .models import Crop, PipelineSettings
 from .processing import (
@@ -24,6 +25,8 @@ from .processing import (
     estimate_reference_background,
     process_image,
 )
+
+VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpeg", ".mpg", ".m4v", ".wmv"}
 
 
 class VideoExtractionWorker(QThread):
@@ -386,15 +389,15 @@ class MainWindow(QMainWindow):
         )
         if not video_path:
             return
-        output_folder = QFileDialog.getExistingDirectory(
-            self, "Select an empty folder for the 100 extracted stages"
-        )
-        if not output_folder:
-            return
+
+        self._start_video_import(Path(video_path))
+
+    def _start_video_import(self, video_path: Path) -> None:
         try:
+            output_folder = video_frames_folder(video_path)
             self.import_video_button.setEnabled(False)
-            self.summary.setText("Extracting 100 evenly spaced video frames...")
-            self._video_worker = VideoExtractionWorker(Path(video_path), Path(output_folder))
+            self.summary.setText("Extracting and filtering 100 evenly spaced video frames...")
+            self._video_worker = VideoExtractionWorker(video_path, output_folder)
             self._video_worker.extractionComplete.connect(self._video_extraction_complete)
             self._video_worker.extractionFailed.connect(self._video_extraction_failed)
             self._video_worker.start()
@@ -407,7 +410,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Video extraction complete",
-            f"Kept {frame_count} evenly spaced frames with brighter average intensity.\n"
+            f"Kept {frame_count} of 100 sampled frames with brighter average intensity.\n"
             f"Each kept frame is available as a separate stage in:\n{output_folder}",
         )
         self.import_video_button.setEnabled(True)
@@ -418,19 +421,33 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Video import failed", message)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if any(url.isLocalFile() and Path(url.toLocalFile()).is_dir()
-               for url in event.mimeData().urls()):
+        if any(
+            url.isLocalFile()
+            and (
+                Path(url.toLocalFile()).is_dir()
+                or Path(url.toLocalFile()).suffix.lower() in VIDEO_SUFFIXES
+            )
+            for url in event.mimeData().urls()
+        ):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event: QDropEvent) -> None:
-        folders = [Path(url.toLocalFile()) for url in event.mimeData().urls()
-                   if url.isLocalFile() and Path(url.toLocalFile()).is_dir()]
-        if not folders:
+        paths = [
+            Path(url.toLocalFile())
+            for url in event.mimeData().urls()
+            if url.isLocalFile()
+        ]
+        folders = [path for path in paths if path.is_dir()]
+        videos = [path for path in paths if path.suffix.lower() in VIDEO_SUFFIXES]
+        if folders:
+            self._load_folder(folders[0])
+        elif videos:
+            self._start_video_import(videos[0])
+        else:
             event.ignore()
             return
-        self._load_folder(folders[0])
         event.acceptProposedAction()
 
     def _load_folder(self, folder: Path) -> None:

@@ -7,11 +7,13 @@ from PIL import Image
 
 from esi_kinetics.io import (
     discover_stages,
+    _bright_frame_indices,
     export_results,
     extract_video_frames,
     load_experiment,
     load_reference_profile,
     save_reference_profile,
+    video_frames_folder,
 )
 from esi_kinetics.models import Crop, PipelineSettings
 from esi_kinetics.processing import process_image
@@ -53,6 +55,27 @@ def test_discover_stages_from_filenames(tmp_path: Path):
     stages = discover_stages(tmp_path)
     assert [stage.name for stage in stages] == ["Stage 01", "Stage 02"]
     assert len(stages[1].paths) == 2
+
+
+def test_video_frames_folder_uses_video_name_and_avoids_existing_data(tmp_path: Path):
+    video_path = tmp_path / "experiment.mp4"
+    expected = tmp_path / "experiment Frames"
+
+    assert video_frames_folder(video_path) == expected
+
+    expected.mkdir()
+    (expected / "stage_001.png").touch()
+    assert video_frames_folder(video_path) == tmp_path / "experiment Frames (2)"
+
+
+def test_bright_frame_selection_keeps_only_values_above_the_mean():
+    brightness = [100.0, 100.1, 100.2, 100.3]
+
+    assert _bright_frame_indices(brightness) == [2, 3]
+
+
+def test_bright_frame_selection_keeps_uniform_video_frames():
+    assert _bright_frame_indices([42.0, 42.0, 42.0]) == [0, 1, 2]
 
 
 def test_discover_stages_sorts_three_digit_video_stages_numerically(tmp_path: Path):
@@ -135,14 +158,12 @@ def test_extract_video_frames_samples_evenly_and_creates_stages(tmp_path: Path):
     output_paths = extract_video_frames(video_path, output_folder)
     experiment = load_experiment(output_folder)
 
-    assert len(output_paths) == 100
-    assert output_paths[0].name == "stage_001.png"
+    assert 0 < len(output_paths) < 100
     assert output_paths[-1].name == "stage_100.png"
-    assert len(experiment.stages) == 100
-    assert experiment.stages[0].name == "Stage 01"
+    assert len(experiment.stages) == len(output_paths)
     assert experiment.stages[-1].name == "Stage 100"
     assert all(image.shape == (6, 8) for image in experiment.combined.values())
-    assert experiment.combined["Stage 01"].mean() < experiment.combined["Stage 100"].mean()
+    assert experiment.combined[experiment.stages[0].name].mean() < experiment.combined["Stage 100"].mean()
 
 
 def test_extract_video_frames_discards_dimmer_group(tmp_path: Path):
