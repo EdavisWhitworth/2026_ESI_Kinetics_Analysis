@@ -2,6 +2,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from pathlib import Path
 import re
+import shutil
 from tempfile import TemporaryDirectory
 
 import numpy as np
@@ -198,6 +199,8 @@ def extract_video_frames(video_path: Path, output_folder: Path, frame_count: int
     output_folder.mkdir(parents=True, exist_ok=True)
     if any(output_folder.iterdir()):
         raise ValueError("Choose an empty folder for extracted video frames")
+    all_frames_folder = output_folder / "All Frames"
+    all_frames_folder.mkdir()
 
     total_frames, _ = imageio_ffmpeg.count_frames_and_secs(str(video_path))
     if total_frames < 1:
@@ -232,6 +235,8 @@ def extract_video_frames(video_path: Path, output_folder: Path, frame_count: int
             reader.close()
 
         selected_indices = _bright_frame_indices(brightness)
+        for index, temporary_path in enumerate(temporary_paths):
+            shutil.copy2(temporary_path, all_frames_folder / f"stage_{index + 1:03d}.png")
         selected_paths = []
         for index in selected_indices:
             temporary_paths[index].replace(output_paths[index])

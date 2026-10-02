@@ -196,6 +196,8 @@ def test_extract_video_frames_samples_evenly_and_creates_stages(tmp_path: Path):
     experiment = load_experiment(output_folder)
 
     assert 0 < len(output_paths) < 100
+    all_frames = sorted((output_folder / "All Frames").glob("*.png"))
+    assert len(all_frames) == 100
     assert output_paths[-1].name == "stage_100.png"
     assert len(experiment.stages) == len(output_paths)
     assert experiment.stages[-1].name == "Stage 100"
@@ -211,6 +213,7 @@ def test_extract_video_frames_discards_dimmer_group(tmp_path: Path):
     output_paths = extract_video_frames(video_path, output_folder, frame_count=12)
 
     assert len(output_paths) == 6
+    assert len(list((output_folder / "All Frames").glob("*.png"))) == 12
     assert all(int(path.stem.split("_")[1]) >= 7 for path in output_paths)
     assert all(np.asarray(Image.open(path)).mean() > 100 for path in output_paths)
 
