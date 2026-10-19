@@ -16,7 +16,7 @@ from .processing import combine_frames, process_image
 
 SUPPORTED_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 DELAY_PATTERN = re.compile(
-    r"(?<![\w.])(\d+(?:\.\d+)?(?:e[+-]?\d+)?)\s*(fs|ps|ns|us|µs|μs|ms|s)(?![A-Za-z])",
+    r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?(?:e[+-]?\d+)?)\s*(fs|ps|ns|us|µs|μs|ms|s)(?![A-Za-z])",
     re.IGNORECASE,
 )
 DELAY_TO_SECONDS = {
@@ -76,6 +76,18 @@ def load_experiment(folder: Path) -> Experiment:
 
 def video_frames_folder(video_path: Path) -> Path:
     base_folder = video_path.with_name(f"{video_path.stem} Frames")
+    candidate = base_folder
+    suffix = 2
+    while candidate.exists() and (
+        not candidate.is_dir() or any(candidate.iterdir())
+    ):
+        candidate = base_folder.with_name(f"{base_folder.name} ({suffix})")
+        suffix += 1
+    return candidate
+
+
+def video_selected_folder(video_path: Path) -> Path:
+    base_folder = video_path.with_name(f"{video_path.stem} Selected Time Points")
     candidate = base_folder
     suffix = 2
     while candidate.exists() and (
@@ -191,7 +203,12 @@ def _bright_frame_indices(brightness: list[float]) -> list[int]:
     return selected or list(range(values.size))
 
 
-def extract_video_frames(video_path: Path, output_folder: Path, frame_count: int = 100) -> list[Path]:
+def extract_video_frames(
+    video_path: Path,
+    output_folder: Path,
+    frame_count: int = 100,
+    selected_output_folder: Path | None = None,
+) -> list[Path]:
     if frame_count < 1:
         raise ValueError("Frame count must be at least one")
     if not video_path.is_file():
@@ -201,12 +218,31 @@ def extract_video_frames(video_path: Path, output_folder: Path, frame_count: int
         raise ValueError("Choose an empty folder for extracted video frames")
     all_frames_folder = output_folder / "All Frames"
     all_frames_folder.mkdir()
+    if selected_output_folder is None:
+        selected_name = output_folder.name.removesuffix(" Frames")
+        selected_output_folder = output_folder.with_name(
+            f"{selected_name} Selected Time Points"
+        )
+        suffix = 2
+        while selected_output_folder.exists() and (
+            not selected_output_folder.is_dir() or any(selected_output_folder.iterdir())
+        ):
+            selected_output_folder = output_folder.with_name(
+                f"{selected_name} Selected Time Points ({suffix})"
+            )
+            suffix += 1
+    selected_output_folder.mkdir(parents=True, exist_ok=True)
+    if any(selected_output_folder.iterdir()):
+        raise ValueError("Choose an empty folder for selected video frames")
 
     total_frames, _ = imageio_ffmpeg.count_frames_and_secs(str(video_path))
     if total_frames < 1:
         raise ValueError("The selected video contains no readable frames")
     sample_indices = np.rint(np.linspace(0, total_frames - 1, frame_count)).astype(np.int64)
-    output_paths = [output_folder / f"stage_{index + 1:03d}.png" for index in range(frame_count)]
+    output_paths = [
+        selected_output_folder / f"stage_{index + 1:03d}.png"
+        for index in range(frame_count)
+    ]
     with TemporaryDirectory(dir=output_folder) as temporary_folder:
         temporary_paths = [
             Path(temporary_folder) / f"stage_{index + 1:03d}.png"
@@ -256,8 +292,11 @@ def extract_video_batch(
             progress_callback(video_path, index, len(video_paths))
         try:
             output_folder = video_frames_folder(video_path)
-            frames = extract_video_frames(video_path, output_folder, frame_count)
-            completed.append((output_folder, len(frames)))
+            selected_folder = video_selected_folder(video_path)
+            frames = extract_video_frames(
+                video_path, output_folder, frame_count, selected_folder
+            )
+            completed.append((selected_folder, len(frames)))
         except Exception as error:
             failures.append(f"{video_path.name}: {error}")
     return completed, failures

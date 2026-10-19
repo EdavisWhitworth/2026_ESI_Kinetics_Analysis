@@ -17,6 +17,7 @@ from esi_kinetics.io import (
     load_reference_profile,
     save_reference_profile,
     video_frames_folder,
+    video_selected_folder,
 )
 from esi_kinetics.models import Crop, PipelineSettings
 from esi_kinetics.processing import process_image
@@ -69,6 +70,17 @@ def test_video_frames_folder_uses_video_name_and_avoids_existing_data(tmp_path: 
     expected.mkdir()
     (expected / "stage_001.png").touch()
     assert video_frames_folder(video_path) == tmp_path / "experiment Frames (2)"
+
+
+def test_video_selected_folder_uses_time_title_and_avoids_existing_data(tmp_path: Path):
+    video_path = tmp_path / "13 ms.mp4"
+    expected = tmp_path / "13 ms Selected Time Points"
+
+    assert video_selected_folder(video_path) == expected
+
+    expected.mkdir()
+    (expected / "stage_001.png").touch()
+    assert video_selected_folder(video_path) == tmp_path / "13 ms Selected Time Points (2)"
 
 
 def test_bright_frame_selection_keeps_only_values_above_the_mean():
@@ -193,11 +205,14 @@ def test_extract_video_frames_samples_evenly_and_creates_stages(tmp_path: Path):
     _write_test_video(video_path)
 
     output_paths = extract_video_frames(video_path, output_folder)
-    experiment = load_experiment(output_folder)
+    selected_folder = tmp_path / "extracted Selected Time Points"
+    experiment = load_experiment(selected_folder)
 
     assert 0 < len(output_paths) < 100
     all_frames = sorted((output_folder / "All Frames").glob("*.png"))
     assert len(all_frames) == 100
+    assert len(list(output_folder.glob("*.png"))) == 0
+    assert len(list(selected_folder.glob("*.png"))) == len(output_paths)
     assert output_paths[-1].name == "stage_100.png"
     assert len(experiment.stages) == len(output_paths)
     assert experiment.stages[-1].name == "Stage 100"
@@ -211,9 +226,12 @@ def test_extract_video_frames_discards_dimmer_group(tmp_path: Path):
     _write_on_off_video(video_path)
 
     output_paths = extract_video_frames(video_path, output_folder, frame_count=12)
+    selected_folder = tmp_path / "extracted Selected Time Points"
 
     assert len(output_paths) == 6
     assert len(list((output_folder / "All Frames").glob("*.png"))) == 12
+    assert len(list(output_folder.glob("*.png"))) == 0
+    assert len(list(selected_folder.glob("*.png"))) == 6
     assert all(int(path.stem.split("_")[1]) >= 7 for path in output_paths)
     assert all(np.asarray(Image.open(path)).mean() > 100 for path in output_paths)
 
@@ -233,10 +251,12 @@ def test_extract_video_batch_creates_sibling_folders_for_all_videos(tmp_path: Pa
 
     assert failures == []
     assert [folder.name for folder, _ in completed] == [
-        "sample_500us Frames", "sample_2ms Frames"
+        "sample_500us Selected Time Points", "sample_2ms Selected Time Points"
     ]
     assert all(count > 0 for _, count in completed)
     assert progress == [(first_video.name, 1, 2), (second_video.name, 2, 2)]
+    rows = analyze_delay_folders(tmp_path, np.zeros((6, 8), dtype=np.float64))
+    assert [row["Folder"] for row in rows] == [folder.name for folder, _ in completed]
 
 
 def test_extract_video_frames_rejects_nonempty_destination(tmp_path: Path):
