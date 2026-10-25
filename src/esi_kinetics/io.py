@@ -75,7 +75,8 @@ def load_experiment(folder: Path) -> Experiment:
 
 
 def video_frames_folder(video_path: Path) -> Path:
-    base_folder = video_path.with_name(f"{video_path.stem} Frames")
+    container = video_path.parent / "All Time Points"
+    base_folder = container / f"{video_path.stem} Frames"
     candidate = base_folder
     suffix = 2
     while candidate.exists() and (
@@ -87,7 +88,8 @@ def video_frames_folder(video_path: Path) -> Path:
 
 
 def video_selected_folder(video_path: Path) -> Path:
-    base_folder = video_path.with_name(f"{video_path.stem} Selected Time Points")
+    container = video_path.parent / "Selected Time Points"
+    base_folder = container / f"{video_path.stem} Selected Time Points"
     candidate = base_folder
     suffix = 2
     while candidate.exists() and (
@@ -216,24 +218,27 @@ def extract_video_frames(
     output_folder.mkdir(parents=True, exist_ok=True)
     if any(output_folder.iterdir()):
         raise ValueError("Choose an empty folder for extracted video frames")
-    all_frames_folder = output_folder / "All Frames"
-    all_frames_folder.mkdir()
     if selected_output_folder is None:
         selected_name = output_folder.name.removesuffix(" Frames")
-        selected_output_folder = output_folder.with_name(
-            f"{selected_name} Selected Time Points"
-        )
+        selected_container = (
+            output_folder.parent.parent
+            if output_folder.parent.name == "All Time Points"
+            else output_folder.parent
+        ) / "Selected Time Points"
+        selected_output_folder = selected_container / f"{selected_name} Selected Time Points"
         suffix = 2
         while selected_output_folder.exists() and (
             not selected_output_folder.is_dir() or any(selected_output_folder.iterdir())
         ):
-            selected_output_folder = output_folder.with_name(
+            selected_output_folder = selected_container / (
                 f"{selected_name} Selected Time Points ({suffix})"
             )
             suffix += 1
     selected_output_folder.mkdir(parents=True, exist_ok=True)
     if any(selected_output_folder.iterdir()):
         raise ValueError("Choose an empty folder for selected video frames")
+    all_frames_folder = output_folder / "All Frames"
+    all_frames_folder.mkdir()
 
     total_frames, _ = imageio_ffmpeg.count_frames_and_secs(str(video_path))
     if total_frames < 1:

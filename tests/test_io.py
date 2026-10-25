@@ -63,24 +63,26 @@ def test_discover_stages_from_filenames(tmp_path: Path):
 
 def test_video_frames_folder_uses_video_name_and_avoids_existing_data(tmp_path: Path):
     video_path = tmp_path / "experiment.mp4"
-    expected = tmp_path / "experiment Frames"
+    expected = tmp_path / "All Time Points" / "experiment Frames"
 
     assert video_frames_folder(video_path) == expected
 
-    expected.mkdir()
+    expected.mkdir(parents=True)
     (expected / "stage_001.png").touch()
-    assert video_frames_folder(video_path) == tmp_path / "experiment Frames (2)"
+    assert video_frames_folder(video_path) == tmp_path / "All Time Points" / "experiment Frames (2)"
 
 
 def test_video_selected_folder_uses_time_title_and_avoids_existing_data(tmp_path: Path):
     video_path = tmp_path / "13 ms.mp4"
-    expected = tmp_path / "13 ms Selected Time Points"
+    expected = tmp_path / "Selected Time Points" / "13 ms Selected Time Points"
 
     assert video_selected_folder(video_path) == expected
 
-    expected.mkdir()
+    expected.mkdir(parents=True)
     (expected / "stage_001.png").touch()
-    assert video_selected_folder(video_path) == tmp_path / "13 ms Selected Time Points (2)"
+    assert video_selected_folder(video_path) == (
+        tmp_path / "Selected Time Points" / "13 ms Selected Time Points (2)"
+    )
 
 
 def test_bright_frame_selection_keeps_only_values_above_the_mean():
@@ -205,7 +207,7 @@ def test_extract_video_frames_samples_evenly_and_creates_stages(tmp_path: Path):
     _write_test_video(video_path)
 
     output_paths = extract_video_frames(video_path, output_folder)
-    selected_folder = tmp_path / "extracted Selected Time Points"
+    selected_folder = tmp_path / "Selected Time Points" / "extracted Selected Time Points"
     experiment = load_experiment(selected_folder)
 
     assert 0 < len(output_paths) < 100
@@ -226,7 +228,7 @@ def test_extract_video_frames_discards_dimmer_group(tmp_path: Path):
     _write_on_off_video(video_path)
 
     output_paths = extract_video_frames(video_path, output_folder, frame_count=12)
-    selected_folder = tmp_path / "extracted Selected Time Points"
+    selected_folder = tmp_path / "Selected Time Points" / "extracted Selected Time Points"
 
     assert len(output_paths) == 6
     assert len(list((output_folder / "All Frames").glob("*.png"))) == 12
@@ -253,9 +255,14 @@ def test_extract_video_batch_creates_sibling_folders_for_all_videos(tmp_path: Pa
     assert [folder.name for folder, _ in completed] == [
         "sample_500us Selected Time Points", "sample_2ms Selected Time Points"
     ]
+    assert all(folder.parent == tmp_path / "Selected Time Points" for folder, _ in completed)
+    assert all((tmp_path / "All Time Points" / f"{video.stem} Frames" / "All Frames").is_dir()
+               for video in (first_video, second_video))
     assert all(count > 0 for _, count in completed)
     assert progress == [(first_video.name, 1, 2), (second_video.name, 2, 2)]
-    rows = analyze_delay_folders(tmp_path, np.zeros((6, 8), dtype=np.float64))
+    rows = analyze_delay_folders(
+        tmp_path / "Selected Time Points", np.zeros((6, 8), dtype=np.float64)
+    )
     assert [row["Folder"] for row in rows] == [folder.name for folder, _ in completed]
 
 
