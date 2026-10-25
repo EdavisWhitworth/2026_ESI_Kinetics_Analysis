@@ -171,6 +171,35 @@ def analyze_delay_folders(parent_folder: Path, background_reference: np.ndarray)
     return sorted(rows, key=lambda row: float(row["Time_Delay"]))
 
 
+def analyze_delay_images(image_folder: Path) -> list[dict[str, object]]:
+    image_paths = sorted(
+        path for path in image_folder.iterdir()
+        if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
+    )
+    if not image_paths:
+        raise ValueError("No supported image files were found in the selected folder.")
+
+    rows = []
+    for image_path in image_paths:
+        delay_seconds, delay_unit = parse_time_delay(image_path.stem)
+        result = process_image(
+            image_path.name,
+            read_image(image_path),
+            PipelineSettings(
+                enable_background=False,
+                enable_connected_region=False,
+            ),
+        )
+        rows.append({
+            "Folder": image_path.stem,
+            "Time_Delay": delay_seconds,
+            "Time_Unit_In_Title": delay_unit,
+            "Mean_Intensity": result.mean_intensity,
+            "Images_Averaged": 1,
+        })
+    return sorted(rows, key=lambda row: float(row["Time_Delay"]))
+
+
 def export_delay_analysis(rows: list[dict[str, object]], workbook_path: Path) -> Path:
     if not rows:
         raise ValueError("There are no delay results to export.")

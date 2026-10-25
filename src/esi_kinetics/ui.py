@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 from .io import (
     export_results,
     analyze_delay_folders,
+    analyze_delay_images,
     export_delay_analysis,
     extract_video_batch,
     load_experiment,
@@ -43,6 +44,24 @@ class DelayAnalysisWorker(QThread):
     def run(self) -> None:
         try:
             rows = analyze_delay_folders(self.parent_folder, self.background_reference)
+            export_delay_analysis(rows, self.workbook_path)
+            self.analysisComplete.emit(str(self.workbook_path), len(rows))
+        except Exception as error:
+            self.analysisFailed.emit(str(error))
+
+
+class DelayImageAnalysisWorker(QThread):
+    analysisComplete = Signal(str, int)
+    analysisFailed = Signal(str)
+
+    def __init__(self, image_folder: Path, workbook_path: Path) -> None:
+        super().__init__()
+        self.image_folder = image_folder
+        self.workbook_path = workbook_path
+
+    def run(self) -> None:
+        try:
+            rows = analyze_delay_images(self.image_folder)
             export_delay_analysis(rows, self.workbook_path)
             self.analysisComplete.emit(str(self.workbook_path), len(rows))
         except Exception as error:
@@ -267,6 +286,7 @@ class MainWindow(QMainWindow):
         self.reference_background = None
         self._video_worker = None
         self._delay_analysis_worker = None
+        self._delay_image_analysis_worker = None
         self._crop_view_origin = (0, 0)
         self._preview_stage = None
         self._segment_scan_key = None
@@ -335,6 +355,9 @@ class MainWindow(QMainWindow):
         batch_analysis_button = QPushButton("Analyze delay folders")
         batch_analysis_button.clicked.connect(self.analyze_delay_folders)
         self.batch_analysis_button = batch_analysis_button
+        selected_image_analysis_button = QPushButton("Analyze highest-intensity images")
+        selected_image_analysis_button.clicked.connect(self.analyze_delay_images)
+        self.selected_image_analysis_button = selected_image_analysis_button
         export_button = QPushButton("Export results")
         export_button.clicked.connect(self.export)
         reset_button = QPushButton("Reset processing")
@@ -347,6 +370,7 @@ class MainWindow(QMainWindow):
         controls.addRow(import_button)
         controls.addRow(import_video_button)
         controls.addRow(batch_analysis_button)
+        controls.addRow(selected_image_analysis_button)
         controls.addRow("Stage", self.stage_selector)
         controls.addRow(self.combine_enabled)
         controls.addRow(self.crop_enabled)
@@ -457,9 +481,50 @@ class MainWindow(QMainWindow):
             self.batch_analysis_button.setEnabled(True)
             QMessageBox.critical(self, "Batch analysis failed", str(error))
 
+    def analyze_delay_images(self) -> None:
+        image_folder = QFileDialog.getExistingDirectory(
+            self, "Select the Highest Intensity Time Points folder"
+        )
+        if not image_folder:
+            return
+        default_path = str(Path(image_folder) / "highest_intensity_mean_intensity.xlsx")
+        workbook_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save time delay vs mean intensity workbook",
+            default_path,
+            "Excel workbook (*.xlsx)",
+        )
+        if not workbook_path:
+            return
+        output_path = Path(workbook_path)
+        if output_path.suffix.lower() != ".xlsx":
+            output_path = output_path.with_suffix(".xlsx")
+        try:
+            self.selected_image_analysis_button.setEnabled(False)
+            self.summary.setText("Analyzing one highest-intensity image per time delay...")
+            self._delay_image_analysis_worker = DelayImageAnalysisWorker(
+                Path(image_folder), output_path
+            )
+            self._delay_image_analysis_worker.analysisComplete.connect(
+                self._delay_analysis_complete
+            )
+            self._delay_image_analysis_worker.analysisFailed.connect(
+                self._delay_image_analysis_failed
+            )
+            self._delay_image_analysis_worker.start()
+        except (OSError, ValueError, RuntimeError) as error:
+            self.selected_image_analysis_button.setEnabled(True)
+            QMessageBox.critical(self, "Image analysis failed", str(error))
+
+    def _delay_image_analysis_failed(self, message: str) -> None:
+        self.summary.setText("Highest-intensity image analysis failed")
+        self.selected_image_analysis_button.setEnabled(True)
+        QMessageBox.critical(self, "Image analysis failed", message)
+
     def _delay_analysis_complete(self, workbook_path: str, delay_count: int) -> None:
         self.summary.setText(f"Batch analysis complete: {delay_count} time delays.")
         self.batch_analysis_button.setEnabled(True)
+        self.selected_image_analysis_button.setEnabled(True)
         QMessageBox.information(
             self,
             "Batch analysis complete",

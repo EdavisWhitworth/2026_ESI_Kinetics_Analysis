@@ -8,6 +8,7 @@ from PIL import Image
 from esi_kinetics.io import (
     discover_stages,
     analyze_delay_folders,
+    analyze_delay_images,
     export_delay_analysis,
     _bright_frame_indices,
     export_results,
@@ -134,6 +135,24 @@ def test_delay_folder_analysis_subtracts_shared_background_and_exports_chart(tmp
         assert "xl/charts/chart1.xml" in workbook.namelist()
         shared_strings = workbook.read("xl/sharedStrings.xml").decode("utf-8")
         assert "Mean_Intensity" in shared_strings
+
+
+def test_delay_image_analysis_uses_one_unadjusted_image_per_filename_delay(tmp_path: Path):
+    Image.fromarray(np.array([[10, 0], [0, 0]], dtype=np.uint8)).save(
+        tmp_path / "2ms.png"
+    )
+    Image.fromarray(np.array([[0, 20], [0, 0]], dtype=np.uint8)).save(
+        tmp_path / "500us.png"
+    )
+
+    rows = analyze_delay_images(tmp_path)
+
+    assert [row["Time_Delay"] for row in rows] == [0.0005, 0.002]
+    assert [row["Mean_Intensity"] for row in rows] == [20.0, 10.0]
+    assert [row["Images_Averaged"] for row in rows] == [1, 1]
+
+    workbook_path = export_delay_analysis(rows, tmp_path / "single_image_results.xlsx")
+    assert workbook_path.is_file()
 
 
 def test_parse_time_delay_requires_unit():
