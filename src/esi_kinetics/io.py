@@ -100,6 +100,18 @@ def video_selected_folder(video_path: Path) -> Path:
     return candidate
 
 
+def video_highest_intensity_folder(video_path: Path) -> Path:
+    base_folder = video_path.parent / "Highest Intensity Time Points"
+    candidate = base_folder
+    suffix = 2
+    while candidate.exists() and (
+        not candidate.is_dir() or any(candidate.iterdir())
+    ):
+        candidate = base_folder.with_name(f"{base_folder.name} ({suffix})")
+        suffix += 1
+    return candidate
+
+
 def parse_time_delay(folder_name: str) -> tuple[float, str]:
     match = DELAY_PATTERN.search(folder_name)
     if match is None:
@@ -294,6 +306,8 @@ def extract_video_batch(
 ) -> tuple[list[tuple[Path, int]], list[str]]:
     completed: list[tuple[Path, int]] = []
     failures: list[str] = []
+    highest_folders: dict[Path, Path] = {}
+    written_names: dict[Path, set[str]] = defaultdict(set)
     for index, video_path in enumerate(video_paths, start=1):
         if progress_callback is not None:
             progress_callback(video_path, index, len(video_paths))
@@ -303,6 +317,22 @@ def extract_video_batch(
             frames = extract_video_frames(
                 video_path, output_folder, frame_count, selected_folder
             )
+            highest_folder = highest_folders.get(video_path.parent)
+            if highest_folder is None:
+                highest_folder = video_highest_intensity_folder(video_path)
+                highest_folder.mkdir(parents=True, exist_ok=True)
+                highest_folders[video_path.parent] = highest_folder
+            brightest_frame = max(
+                frames,
+                key=lambda path: float(np.mean(read_image(path), dtype=np.float64)),
+            )
+            output_name = f"{video_path.stem}.png"
+            name_suffix = 2
+            while output_name in written_names[highest_folder]:
+                output_name = f"{video_path.stem} ({name_suffix}).png"
+                name_suffix += 1
+            shutil.copy2(brightest_frame, highest_folder / output_name)
+            written_names[highest_folder].add(output_name)
             completed.append((selected_folder, len(frames)))
         except Exception as error:
             failures.append(f"{video_path.name}: {error}")

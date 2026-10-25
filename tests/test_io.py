@@ -16,6 +16,7 @@ from esi_kinetics.io import (
     load_experiment,
     load_reference_profile,
     save_reference_profile,
+    video_highest_intensity_folder,
     video_frames_folder,
     video_selected_folder,
 )
@@ -82,6 +83,19 @@ def test_video_selected_folder_uses_time_title_and_avoids_existing_data(tmp_path
     (expected / "stage_001.png").touch()
     assert video_selected_folder(video_path) == (
         tmp_path / "Selected Time Points" / "13 ms Selected Time Points (2)"
+    )
+
+
+def test_video_highest_intensity_folder_avoids_existing_data(tmp_path: Path):
+    video_path = tmp_path / "13 ms.mp4"
+    expected = tmp_path / "Highest Intensity Time Points"
+
+    assert video_highest_intensity_folder(video_path) == expected
+
+    expected.mkdir()
+    (expected / "13 ms.png").touch()
+    assert video_highest_intensity_folder(video_path) == (
+        tmp_path / "Highest Intensity Time Points (2)"
     )
 
 
@@ -258,6 +272,21 @@ def test_extract_video_batch_creates_sibling_folders_for_all_videos(tmp_path: Pa
     assert all(folder.parent == tmp_path / "Selected Time Points" for folder, _ in completed)
     assert all((tmp_path / "All Time Points" / f"{video.stem} Frames" / "All Frames").is_dir()
                for video in (first_video, second_video))
+    highest_folder = tmp_path / "Highest Intensity Time Points"
+    highest_images = sorted(highest_folder.glob("*.png"))
+    assert [path.name for path in highest_images] == [
+        "sample_2ms.png", "sample_500us.png"
+    ]
+    for video, selected_folder in zip((first_video, second_video), (folder for folder, _ in completed)):
+        selected_images = list(selected_folder.glob("*.png"))
+        expected_image = max(
+            selected_images,
+            key=lambda path: float(np.asarray(Image.open(path), dtype=np.float64).mean()),
+        )
+        aggregate_image = highest_folder / f"{video.stem}.png"
+        np.testing.assert_array_equal(
+            np.asarray(Image.open(aggregate_image)), np.asarray(Image.open(expected_image))
+        )
     assert all(count > 0 for _, count in completed)
     assert progress == [(first_video.name, 1, 2), (second_video.name, 2, 2)]
     rows = analyze_delay_folders(
