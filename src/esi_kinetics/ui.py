@@ -530,6 +530,13 @@ class MainWindow(QMainWindow):
             path for path in paths
             if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES
         ]
+        videos.extend(
+            video_path
+            for folder in folders
+            for video_path in sorted(folder.rglob("*"))
+            if video_path.is_file() and video_path.suffix.lower() in VIDEO_SUFFIXES
+        )
+        videos = list(dict.fromkeys(videos))
         if videos:
             self._start_video_import(videos)
         elif folders:
