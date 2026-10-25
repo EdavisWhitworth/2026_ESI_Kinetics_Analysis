@@ -85,10 +85,10 @@ def test_video_selected_folder_uses_time_title_and_avoids_existing_data(tmp_path
     )
 
 
-def test_bright_frame_selection_keeps_only_values_above_the_mean():
+def test_bright_frame_selection_uses_higher_mean_plus_half_standard_deviation():
     brightness = [100.0, 100.1, 100.2, 100.3]
 
-    assert _bright_frame_indices(brightness) == [2, 3]
+    assert _bright_frame_indices(brightness) == [3]
 
 
 def test_bright_frame_selection_keeps_uniform_video_frames():

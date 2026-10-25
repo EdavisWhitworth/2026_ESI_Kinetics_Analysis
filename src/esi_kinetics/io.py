@@ -201,8 +201,10 @@ def _bright_frame_indices(brightness: list[float]) -> list[int]:
         return list(range(values.size))
 
     average_brightness = float(np.mean(values, dtype=np.float64))
-    selected = np.flatnonzero(values > average_brightness).tolist()
-    return selected or list(range(values.size))
+    brightness_spread = float(np.std(values, dtype=np.float64))
+    threshold = average_brightness + 0.5 * brightness_spread
+    selected = np.flatnonzero(values > threshold).tolist()
+    return selected or [int(np.argmax(values))]
 
 
 def extract_video_frames(
