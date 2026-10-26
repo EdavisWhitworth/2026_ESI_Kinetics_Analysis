@@ -11,7 +11,7 @@ import pandas as pd
 import xlsxwriter
 from PIL import Image
 
-from .models import Experiment, PipelineSettings, Stage, StageResult
+from .models import Crop, Experiment, PipelineSettings, Stage, StageResult
 from .processing import combine_frames, process_image
 
 SUPPORTED_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
@@ -171,17 +171,48 @@ def analyze_delay_folders(parent_folder: Path, background_reference: np.ndarray)
     return sorted(rows, key=lambda row: float(row["Time_Delay"]))
 
 
-def analyze_delay_images(image_folder: Path) -> list[dict[str, object]]:
-    image_paths = sorted(
-        path for path in image_folder.iterdir()
+def _delay_from_image_or_folder(image_path: Path, folder: Path) -> tuple[float, str]:
+    candidates = [image_path.stem, image_path.parent.name, folder.name]
+    if image_path.parent != folder:
+        candidates.append(image_path.parent.parent.name)
+    seen: set[str] = set()
+    for anchor in candidates:
+        if anchor in seen:
+            continue
+        seen.add(anchor)
+        try:
+            return parse_time_delay(anchor)
+        except ValueError:
+            pass
+    raise ValueError(
+        f"Could not infer a time delay from '{image_path.name}' or folder names near '{folder.name}'."
+    )
+
+
+def _iter_image_paths(folder: Path) -> list[Path]:
+    direct_paths = sorted(
+        path for path in folder.iterdir()
         if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
     )
+    if direct_paths:
+        return direct_paths
+    nested_paths = sorted(
+        path for path in folder.rglob("*")
+        if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
+    )
+    if nested_paths:
+        return nested_paths
+    return []
+
+
+def analyze_delay_images(image_folder: Path) -> list[dict[str, object]]:
+    image_paths = _iter_image_paths(image_folder)
     if not image_paths:
         raise ValueError("No supported image files were found in the selected folder.")
 
     rows = []
     for image_path in image_paths:
-        delay_seconds, delay_unit = parse_time_delay(image_path.stem)
+        delay_seconds, delay_unit = _delay_from_image_or_folder(image_path, image_folder)
         result = process_image(
             image_path.name,
             read_image(image_path),
@@ -198,6 +229,85 @@ def analyze_delay_images(image_folder: Path) -> list[dict[str, object]]:
             "Images_Averaged": 1,
         })
     return sorted(rows, key=lambda row: float(row["Time_Delay"]))
+
+
+def analyze_delay_images_with_crop(
+    image_folder: Path,
+    crop: Crop | None = None,
+    background_reference: np.ndarray | None = None,
+    signal_mask: np.ndarray | None = None,
+) -> list[dict[str, object]]:
+    image_paths = _iter_image_paths(image_folder)
+    if not image_paths:
+        raise ValueError("No supported image files were found in the selected folder.")
+
+    rows: list[dict[str, object]] = []
+    for image_path in image_paths:
+        image = read_image(image_path)
+        if background_reference is not None:
+            if background_reference.shape != image.shape:
+                raise ValueError(
+                    f"Background dimensions do not match '{image_path.name}'."
+                )
+            image = np.maximum(image - background_reference, 0.0)
+        if signal_mask is not None:
+            if signal_mask.shape != image.shape:
+                raise ValueError(f"Signal mask dimensions do not match '{image_path.name}'.")
+            image = np.where(signal_mask, image, 0.0)
+        if crop is not None:
+            crop.validate(image.shape[1], image.shape[0])
+            image = image[crop.y0:crop.y1, crop.x0:crop.x1]
+        delay_seconds, delay_unit = _delay_from_image_or_folder(image_path, image_folder)
+        result = process_image(
+            image_path.name,
+            image,
+            PipelineSettings(
+                enable_background=False,
+                enable_connected_region=False,
+            ),
+        )
+        rows.append({
+            "Folder": image_path.stem,
+            "Time_Delay": delay_seconds,
+            "Time_Unit_In_Title": delay_unit,
+            "Mean_Intensity": result.mean_intensity,
+            "Images_Averaged": 1,
+        })
+    return sorted(rows, key=lambda row: float(row["Time_Delay"]))
+
+
+def average_selected_frame_folders(
+    selected_root: Path,
+    output_folder: Path | None = None,
+) -> Path:
+    timepoint_folders = sorted(path for path in selected_root.iterdir() if path.is_dir())
+    if not timepoint_folders:
+        raise ValueError("The selected-frames folder must contain one subfolder per time point.")
+    if output_folder is None:
+        output_folder = selected_root.parent / "Averaged Selected Frames"
+        suffix = 2
+        while output_folder.exists():
+            output_folder = selected_root.parent / f"Averaged Selected Frames ({suffix})"
+            suffix += 1
+    output_folder.mkdir(parents=True, exist_ok=False)
+
+    for timepoint_folder in timepoint_folders:
+        image_paths = sorted(
+            path for path in timepoint_folder.iterdir()
+            if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
+        )
+        if not image_paths:
+            raise ValueError(f"No supported images found in '{timepoint_folder.name}'.")
+        images = [read_image(path) for path in image_paths]
+        image_shape = images[0].shape
+        if any(image.shape != image_shape for image in images):
+            raise ValueError(
+                f"Images in '{timepoint_folder.name}' do not have matching dimensions."
+            )
+        average = np.mean(np.stack(images, axis=0), axis=0, dtype=np.float64)
+        output_path = output_folder / f"{timepoint_folder.name}.png"
+        Image.fromarray(np.rint(np.clip(average, 0, 255)).astype(np.uint8)).save(output_path)
+    return output_folder
 
 
 def export_delay_analysis(rows: list[dict[str, object]], workbook_path: Path) -> Path:
@@ -234,6 +344,60 @@ def export_delay_analysis(rows: list[dict[str, object]], workbook_path: Path) ->
         chart.set_size({"width": 760, "height": 440})
         worksheet.insert_chart("G2", chart)
     return workbook_path
+
+
+def export_delay_curve_analysis(rows: list[dict[str, object]], workbook_path: Path) -> Path:
+    if not rows:
+        raise ValueError("There are no delay results to export.")
+    workbook_path.parent.mkdir(parents=True, exist_ok=True)
+    normalized = []
+    for row in rows:
+        time_delay = float(row.get("Time_Delay", row.get("Time_Delay_s", 0.0)))
+        intensity = float(row.get("Mean_Intensity", row.get("Intensity", 0.0)))
+        normalized.append({
+            "Time_Delay_ms": time_delay * 1000.0,
+            "Intensity": intensity,
+            "Ln_Intensity": float(np.log(max(intensity, 1e-12))),
+        })
+    dataframe = (
+        pd.DataFrame(normalized, columns=["Time_Delay_ms", "Intensity", "Ln_Intensity"])
+        .sort_values("Time_Delay_ms")
+        .reset_index(drop=True)
+    )
+
+    with pd.ExcelWriter(workbook_path, engine="xlsxwriter") as writer:
+        dataframe.to_excel(writer, sheet_name="Intensity Analysis", index=False)
+        worksheet = writer.sheets["Intensity Analysis"]
+        worksheet.freeze_panes(1, 0)
+        worksheet.set_column("A:A", 18)
+        worksheet.set_column("B:B", 16)
+        worksheet.set_column("C:C", 18)
+        worksheet.autofilter(0, 0, len(dataframe), 2)
+    return workbook_path
+
+
+def apply_crop_to_folder(
+    source_folder: Path,
+    crop: "Crop | None",
+    output_folder: Path | None = None,
+) -> Path:
+    if crop is None:
+        raise ValueError("A crop rectangle is required before applying it to a folder.")
+    image_paths = sorted(
+        path for path in source_folder.iterdir()
+        if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
+    )
+    if not image_paths:
+        raise ValueError("No supported image files were found in the selected folder.")
+    if output_folder is None:
+        output_folder = source_folder.parent / f"{source_folder.name}_cropped"
+    output_folder.mkdir(parents=True, exist_ok=True)
+    for image_path in image_paths:
+        image = read_image(image_path)
+        cropped = image[crop.y0:crop.y1, crop.x0:crop.x1]
+        output_path = output_folder / image_path.name
+        Image.fromarray(np.clip(cropped, 0, 255).astype(np.uint8)).save(output_path)
+    return output_folder
 
 
 def _bright_frame_indices(brightness: list[float]) -> list[int]:

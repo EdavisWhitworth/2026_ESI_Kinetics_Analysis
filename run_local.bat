@@ -19,6 +19,7 @@ if errorlevel 1 (
 )
 
 set "PYTHONPATH=%CD%\src"
+set "QT_QPA_PLATFORM=windows"
 echo Starting ESI Kinetics Analysis...
 ".venv\Scripts\python.exe" main.py
 set "exit_code=%ERRORLEVEL%"

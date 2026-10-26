@@ -8,16 +8,22 @@ from PySide6.QtWidgets import (
     QLabel, QMainWindow, QMessageBox, QPushButton, QDoubleSpinBox, QSpinBox,
     QSplitter, QVBoxLayout, QWidget,
     QScrollArea,
+    QStackedWidget,
 )
 
 from .io import (
     export_results,
     analyze_delay_folders,
     analyze_delay_images,
+    analyze_delay_images_with_crop,
+    average_selected_frame_folders,
+    apply_crop_to_folder,
     export_delay_analysis,
+    export_delay_curve_analysis,
     extract_video_batch,
     load_experiment,
     load_reference_profile,
+    read_image,
     save_reference_profile,
 )
 from .models import Crop, PipelineSettings
@@ -29,6 +35,7 @@ from .processing import (
 )
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpeg", ".mpg", ".m4v", ".wmv"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 
 class DelayAnalysisWorker(QThread):
@@ -100,7 +107,9 @@ class ImagePreview(QWidget):
         self._contrast = 1.0
         self._display_max = 1.0
         self._image_rect = None
+        self._view_rect = QRect()
         self._selection = None
+        self._selection_visible = False
         self._drag_start = None
         self._drag_current = None
         self._crop_mode = False
@@ -112,6 +121,7 @@ class ImagePreview(QWidget):
         self._source_image = image.astype(np.float64, copy=True)
         self._display_max = max(float(display_max if display_max is not None else image.max()), 1.0)
         self._render_image()
+        self._view_rect = QRect(0, 0, self._image.width(), self._image.height())
         self._selection = None
         self.update()
 
@@ -170,6 +180,27 @@ class ImagePreview(QWidget):
         self._selection = (x0, y0, x1, y1)
         self.update()
 
+    def set_selection_visible(self, visible: bool) -> None:
+        self._selection_visible = visible
+        self.update()
+
+    def set_view_crop(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        if self._image.isNull() or x1 <= x0 or y1 <= y0:
+            return
+        margin_x = max(1, round((x1 - x0) * 0.08))
+        margin_y = max(1, round((y1 - y0) * 0.08))
+        left = max(0, x0 - margin_x)
+        top = max(0, y0 - margin_y)
+        right = min(self._image.width(), x1 + margin_x)
+        bottom = min(self._image.height(), y1 + margin_y)
+        self._view_rect = QRect(left, top, right - left, bottom - top)
+        self.update()
+
+    def set_view_full(self) -> None:
+        if not self._image.isNull():
+            self._view_rect = QRect(0, 0, self._image.width(), self._image.height())
+            self.update()
+
     def set_crop_mode(self, enabled: bool) -> None:
         self._crop_mode = enabled
         self._selection = None
@@ -187,16 +218,23 @@ class ImagePreview(QWidget):
             self._image_rect = None
             return
         self._image_rect = self._display_rect()
-        painter.drawImage(self._image_rect, self._image)
-        selection = self._drag_current or (self._selection if self._crop_mode else None)
+        painter.drawImage(self._image_rect, self._image, self._view_rect)
+        selection = self._drag_current or (
+            self._selection if self._crop_mode or self._selection_visible else None
+        )
         if selection:
             x0, y0, x1, y1 = selection
-            scale_x = self._image_rect.width() / self._image.width()
-            scale_y = self._image_rect.height() / self._image.height()
-            rectangle = self._image_rect.adjusted(
-                round(x0 * scale_x), round(y0 * scale_y),
-                -round((self._image.width() - x1) * scale_x),
-                -round((self._image.height() - y1) * scale_y),
+            scale_x = self._image_rect.width() / self._view_rect.width()
+            scale_y = self._image_rect.height() / self._view_rect.height()
+            local_x0 = x0 - self._view_rect.x()
+            local_y0 = y0 - self._view_rect.y()
+            local_x1 = x1 - self._view_rect.x()
+            local_y1 = y1 - self._view_rect.y()
+            rectangle = QRect(
+                self._image_rect.x() + round(local_x0 * scale_x),
+                self._image_rect.y() + round(local_y0 * scale_y),
+                round((local_x1 - local_x0) * scale_x),
+                round((local_y1 - local_y0) * scale_y),
             )
             painter.setPen(QPen(Qt.GlobalColor.red, 2))
             painter.drawRect(rectangle)
@@ -255,18 +293,26 @@ class ImagePreview(QWidget):
             self._image_rect = self._display_rect()
 
     def _display_rect(self) -> QRect:
-        display_size = self._image.size()
+        display_size = self._view_rect.size()
         display_size.scale(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
         x = (self.width() - display_size.width()) // 2
         y = (self.height() - display_size.height()) // 2
         return QRect(x, y, display_size.width(), display_size.height())
 
     def _image_point(self, point) -> tuple[int, int]:
-        x = (point.x() - self._image_rect.left()) * self._image.width() / self._image_rect.width()
-        y = (point.y() - self._image_rect.top()) * self._image.height() / self._image_rect.height()
+        x = self._view_rect.x() + (
+            (point.x() - self._image_rect.left())
+            * self._view_rect.width()
+            / self._image_rect.width()
+        )
+        y = self._view_rect.y() + (
+            (point.y() - self._image_rect.top())
+            * self._view_rect.height()
+            / self._image_rect.height()
+        )
         return (
-            max(0, min(self._image.width(), round(x))),
-            max(0, min(self._image.height(), round(y))),
+            max(self._view_rect.x(), min(self._view_rect.x() + self._view_rect.width(), round(x))),
+            max(self._view_rect.y(), min(self._view_rect.y() + self._view_rect.height(), round(y))),
         )
 
     @staticmethod
@@ -287,8 +333,19 @@ class MainWindow(QMainWindow):
         self._video_worker = None
         self._delay_analysis_worker = None
         self._delay_image_analysis_worker = None
+        self.batch_crop: Crop | None = None
         self._crop_view_origin = (0, 0)
+        self._crop_reference_image_loaded = False
+        self._crop_reference_path: Path | None = None
+        self._selected_signal_mask: np.ndarray | None = None
+        self._background_subtraction_enabled = False
+        self._averaged_selected_folder: Path | None = None
         self._preview_stage = None
+        self.show_crop_overlay = QCheckBox("Highlight saved crop")
+        self.apply_crop_enabled = QCheckBox("Apply saved crop")
+        self.apply_crop_enabled.setEnabled(False)
+        self.subtract_saved_background_enabled = QCheckBox("Subtract saved background")
+        self.subtract_saved_background_enabled.setEnabled(False)
         self._segment_scan_key = None
         self._segment_scan_labels = None
         self.stage_selector = QComboBox()
@@ -344,6 +401,9 @@ class MainWindow(QMainWindow):
         self.combine_enabled.setChecked(True)
         self.mode = QComboBox()
         self.mode.addItems(["Threshold mask", "Subtract background"])
+        self.control_mode = QComboBox()
+        self.control_mode.addItems(["New controls", "Old controls"])
+        self.control_mode.setCurrentIndex(0)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -352,12 +412,27 @@ class MainWindow(QMainWindow):
         import_video_button = QPushButton("Import videos (select multiple)")
         import_video_button.clicked.connect(self.import_video)
         self.import_video_button = import_video_button
+        import_selected_image_button = QPushButton("Upload reference photo")
+        import_selected_image_button.clicked.connect(self.import_selected_image)
+        self.import_selected_image_button = import_selected_image_button
+        average_selected_frames_button = QPushButton("Average selected frame folders")
+        average_selected_frames_button.clicked.connect(self.average_selected_frame_folders)
+        self.average_selected_frames_button = average_selected_frames_button
         batch_analysis_button = QPushButton("Analyze delay folders")
         batch_analysis_button.clicked.connect(self.analyze_delay_folders)
         self.batch_analysis_button = batch_analysis_button
+        save_batch_crop_button = QPushButton("Save batch crop")
+        save_batch_crop_button.clicked.connect(self.save_batch_crop)
+        self.save_batch_crop_button = save_batch_crop_button
+        apply_crop_folder_button = QPushButton("Apply crop to image folder")
+        apply_crop_folder_button.clicked.connect(self.apply_crop_to_image_folder)
+        self.apply_crop_folder_button = apply_crop_folder_button
         selected_image_analysis_button = QPushButton("Analyze highest-intensity images")
         selected_image_analysis_button.clicked.connect(self.analyze_delay_images)
         self.selected_image_analysis_button = selected_image_analysis_button
+        cropped_image_analysis_button = QPushButton("Analyze averaged selected frames")
+        cropped_image_analysis_button.clicked.connect(self.analyze_cropped_delay_images)
+        self.cropped_image_analysis_button = cropped_image_analysis_button
         export_button = QPushButton("Export results")
         export_button.clicked.connect(self.export)
         reset_button = QPushButton("Reset processing")
@@ -366,31 +441,56 @@ class MainWindow(QMainWindow):
         save_profile_button.clicked.connect(self.save_profile)
         load_profile_button = QPushButton("Load background image")
         load_profile_button.clicked.connect(self.load_profile)
-        controls = QFormLayout()
-        controls.addRow(import_button)
-        controls.addRow(import_video_button)
-        controls.addRow(batch_analysis_button)
-        controls.addRow(selected_image_analysis_button)
-        controls.addRow("Stage", self.stage_selector)
-        controls.addRow(self.combine_enabled)
-        controls.addRow(self.crop_enabled)
-        controls.addRow("Crop x0 / x1", self._pair(self.x0, self.x1))
-        controls.addRow("Crop y0 / y1", self._pair(self.y0, self.y1))
-        controls.addRow(self.zero_outside_box)
-        controls.addRow(self.background_enabled)
-        controls.addRow(self.connected_region_enabled)
-        controls.addRow(self.scan_segments_enabled)
-        controls.addRow("Segment brightness above average", self.segment_offset)
-        controls.addRow(self.isolate_segment_enabled)
-        controls.addRow(self.use_reference_profile)
-        controls.addRow(self._pair(save_profile_button, load_profile_button))
-        controls.addRow("Background mode", self.mode)
-        controls.addRow("Threshold", self.threshold)
-        controls.addRow("Background value", self.background)
-        controls.addRow("Preview contrast", self.contrast)
-        controls.addRow(reset_button)
-        controls.addRow(export_button)
+        self.save_profile_button = save_profile_button
+        self.load_profile_button = load_profile_button
+
+        old_controls_layout = QFormLayout()
+        old_controls_layout.addRow(import_button)
+        old_controls_layout.addRow(import_video_button)
+        old_controls_layout.addRow(batch_analysis_button)
+        old_controls_layout.addRow(selected_image_analysis_button)
+        old_controls_layout.addRow(save_batch_crop_button)
+        old_controls_layout.addRow(cropped_image_analysis_button)
+        old_controls_layout.addRow("Stage", self.stage_selector)
+        old_controls_layout.addRow(self.combine_enabled)
+        old_controls_layout.addRow(self.crop_enabled)
+        old_controls_layout.addRow("Crop x0 / x1", self._pair(self.x0, self.x1))
+        old_controls_layout.addRow("Crop y0 / y1", self._pair(self.y0, self.y1))
+        old_controls_layout.addRow(self.zero_outside_box)
+        old_controls_layout.addRow(self.background_enabled)
+        old_controls_layout.addRow(self.connected_region_enabled)
+        old_controls_layout.addRow(self.scan_segments_enabled)
+        old_controls_layout.addRow("Segment brightness above average", self.segment_offset)
+        old_controls_layout.addRow(self.isolate_segment_enabled)
+        old_controls_layout.addRow(self.use_reference_profile)
+        old_controls_layout.addRow(self._pair(save_profile_button, load_profile_button))
+        old_controls_layout.addRow("Background mode", self.mode)
+        old_controls_layout.addRow("Threshold", self.threshold)
+        old_controls_layout.addRow("Background value", self.background)
+        old_controls_layout.addRow("Preview contrast", self.contrast)
+        old_controls_layout.addRow(reset_button)
+        old_controls_layout.addRow(export_button)
+
+        new_controls_layout = QFormLayout()
+        new_controls_layout.addRow("1. Upload video files", import_video_button)
+        new_controls_layout.addRow("2. Average selected frame folders", average_selected_frames_button)
+        new_controls_layout.addRow("3. Reference photo", import_selected_image_button)
+        new_controls_layout.addRow("Draw crop", self.crop_enabled)
+        new_controls_layout.addRow(save_batch_crop_button)
+        new_controls_layout.addRow(self.show_crop_overlay)
+        new_controls_layout.addRow("Find bright segments", self.scan_segments_enabled)
+        new_controls_layout.addRow("Segment threshold above mean", self.segment_offset)
+        new_controls_layout.addRow(self._pair(save_profile_button, load_profile_button))
+        new_controls_layout.addRow("4. Apply crop to analysis", self.apply_crop_enabled)
+        new_controls_layout.addRow(
+            "Subtract uploaded background profile", self.subtract_saved_background_enabled
+        )
+        new_controls_layout.addRow("5. Analyze averaged selected frames", cropped_image_analysis_button)
+        new_controls_layout.addRow("Preview contrast", self.contrast)
+
         self.crop_enabled.stateChanged.connect(self.crop_mode_changed)
+        self.show_crop_overlay.stateChanged.connect(self.update_crop_overlay)
+        self.apply_crop_enabled.stateChanged.connect(self.update_crop_overlay)
         self.zero_outside_box.stateChanged.connect(self.refresh_preview)
         self.background_enabled.stateChanged.connect(self.refresh_preview)
         self.connected_region_enabled.stateChanged.connect(self.refresh_preview)
@@ -403,10 +503,29 @@ class MainWindow(QMainWindow):
         for widget in (self.threshold, self.background, self.x0, self.y0, self.x1, self.y1):
             widget.valueChanged.connect(self.refresh_preview)
         self.summary.setWordWrap(True)
+
+        old_controls_widget = QWidget()
+        old_controls_widget.setLayout(old_controls_layout)
+        new_controls_widget = QWidget()
+        new_controls_widget.setLayout(new_controls_layout)
+
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        header_layout.addWidget(QLabel("Controls mode"))
+        header_layout.addWidget(self.control_mode)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+
         left = QWidget()
         left_layout = QVBoxLayout(left)
-        left_layout.addLayout(controls)
+        left_layout.addWidget(header)
+        control_stack = QStackedWidget()
+        control_stack.addWidget(new_controls_widget)
+        control_stack.addWidget(old_controls_widget)
+        self.control_stack = control_stack
+        self.control_mode.currentIndexChanged.connect(control_stack.setCurrentIndex)
+        left_layout.addWidget(control_stack)
         left_layout.addWidget(self.summary)
+
         control_scroll = QScrollArea()
         control_scroll.setWidgetResizable(True)
         control_scroll.setWidget(left)
@@ -516,6 +635,196 @@ class MainWindow(QMainWindow):
             self.selected_image_analysis_button.setEnabled(True)
             QMessageBox.critical(self, "Image analysis failed", str(error))
 
+    def save_batch_crop(self) -> None:
+        if not self.crop_selection_complete:
+            QMessageBox.information(
+                self,
+                "No crop selected",
+                "Select a crop on the current preview before saving the fixed batch crop.",
+            )
+            return
+        self.batch_crop = Crop(
+            self.x0.value(),
+            self.y0.value(),
+            self.x1.value(),
+            self.y1.value(),
+        )
+        self.apply_crop_enabled.setEnabled(True)
+        self.show_crop_overlay.setChecked(True)
+        self.preview.set_crop_mode(False)
+        self.update_crop_overlay()
+        QMessageBox.information(
+            self,
+            "Batch crop saved",
+            "This crop will be applied to every image in the highest-intensity folder export.",
+        )
+
+    def update_crop_overlay(self) -> None:
+        edit_crop = self.crop_enabled.isChecked() or self._crop_reference_image_loaded
+        if self.batch_crop is None:
+            self.preview.set_view_full()
+            self.preview.set_selection_visible(False)
+            self.preview.set_crop_mode(edit_crop)
+            return
+        if self.show_crop_overlay.isChecked():
+            origin_x, origin_y = (0, 0)
+            if (self.crop_enabled.isChecked() and self.crop_selection_complete
+                    and not self.zero_outside_box.isChecked()):
+                origin_x, origin_y = self._crop_view_origin
+            if self._crop_reference_image_loaded:
+                self.preview.set_view_crop(
+                    self.batch_crop.x0,
+                    self.batch_crop.y0,
+                    self.batch_crop.x1,
+                    self.batch_crop.y1,
+                )
+            self.preview.set_crop_mode(False)
+            self.preview.set_selection(
+                self.batch_crop.x0 - origin_x,
+                self.batch_crop.y0 - origin_y,
+                self.batch_crop.x1 - origin_x,
+                self.batch_crop.y1 - origin_y,
+            )
+            self.preview.set_selection_visible(True)
+        else:
+            self.preview.set_selection_visible(False)
+            self.preview.set_view_full()
+            self.preview.set_crop_mode(edit_crop)
+
+    def apply_crop_to_image_folder(self) -> None:
+        if self.batch_crop is None:
+            QMessageBox.information(
+                self,
+                "Batch crop required",
+                "Set and save a crop before applying it to a folder of uncropped images.",
+            )
+            return
+        source_folder = QFileDialog.getExistingDirectory(self, "Select uncropped image folder")
+        if not source_folder:
+            return
+        output_folder = QFileDialog.getExistingDirectory(self, "Choose where to save the cropped images")
+        if not output_folder:
+            return
+        try:
+            applied = apply_crop_to_folder(Path(source_folder), self.batch_crop, Path(output_folder))
+            self.summary.setText(f"Applied crop to {len(list(applied.iterdir()))} images.")
+            QMessageBox.information(
+                self,
+                "Crop applied",
+                f"Saved the cropped images to:\n{applied}",
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            QMessageBox.critical(self, "Crop application failed", str(error))
+
+    def import_selected_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select one selected frame image",
+            "",
+            "Image files (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)",
+        )
+        if not path:
+            return
+        self.load_reference_image(Path(path))
+
+    def load_reference_image(self, image_path: Path) -> None:
+        image = read_image(image_path)
+        self._crop_reference_image_loaded = True
+        self._crop_reference_path = image_path
+        self._selected_signal_mask = None
+        self._segment_scan_labels = None
+        self.batch_crop = None
+        self.crop_selection_complete = False
+        self.reference_background = None
+        self.reference_signal_mask = None
+        self.subtract_saved_background_enabled.setChecked(False)
+        self.subtract_saved_background_enabled.setEnabled(False)
+        self.apply_crop_enabled.setChecked(False)
+        self.apply_crop_enabled.setEnabled(False)
+        self.crop_enabled.setChecked(True)
+        self.show_crop_overlay.setChecked(False)
+        height, width = image.shape[:2]
+        for spinbox, maximum, value in (
+            (self.x0, width, 0),
+            (self.y0, height, 0),
+            (self.x1, width, width),
+            (self.y1, height, height),
+        ):
+            spinbox.setRange(0, maximum)
+            spinbox.setValue(value)
+        self._crop_view_origin = (0, 0)
+        self._preview_stage = None
+        self.preview.set_reference_masks(None)
+        self.preview.set_segment_labels(None)
+        self.preview.set_crop_mode(True)
+        self.preview.set_image(image, display_max=255.0)
+        self.preview.set_contrast(self.contrast.value())
+        self.summary.setText(f"Selected frame ready for crop: {image_path.name}")
+        self.refresh_reference_segments()
+
+    def analyze_cropped_delay_images(self) -> None:
+        if not self.apply_crop_enabled.isChecked():
+            QMessageBox.information(
+                self,
+                "Apply crop first",
+                "Select Apply saved crop before analyzing averaged selected frames.",
+            )
+            return
+        if self.batch_crop is None:
+            QMessageBox.information(self, "Batch crop required", "Draw and save a crop first.")
+            return
+        if not self.subtract_saved_background_enabled.isChecked():
+            QMessageBox.information(
+                self,
+                "Background subtraction required",
+                "Select Subtract saved background before analyzing averaged selected frames.",
+            )
+            return
+        if self.reference_background is None or self._selected_signal_mask is None:
+            QMessageBox.information(
+                self,
+                "Background profile required",
+                "Upload or save a background profile before the final analysis.",
+            )
+            return
+        image_folder = QFileDialog.getExistingDirectory(
+            self, "Select the Averaged Selected Frames folder"
+        )
+        if not image_folder:
+            return
+        default_path = str(Path(image_folder) / "averaged_selected_intensity.xlsx")
+        workbook_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save cropped batch workbook",
+            default_path,
+            "Excel workbook (*.xlsx)",
+        )
+        if not workbook_path:
+            return
+        output_path = Path(workbook_path)
+        if output_path.suffix.lower() != ".xlsx":
+            output_path = output_path.with_suffix(".xlsx")
+        try:
+            self.cropped_image_analysis_button.setEnabled(False)
+            self.summary.setText("Applying saved background and crop to averaged time points...")
+            rows = analyze_delay_images_with_crop(
+                Path(image_folder),
+                self.batch_crop,
+                background_reference=self.reference_background,
+                signal_mask=self._selected_signal_mask,
+            )
+            export_delay_curve_analysis(rows, output_path)
+            self.cropped_image_analysis_button.setEnabled(True)
+            self.summary.setText(f"Batch analysis complete: {len(rows)} time delays.")
+            QMessageBox.information(
+                self,
+                "Averaged-frame analysis complete",
+                f"Analyzed {len(rows)} averaged time points and saved the workbook to:\n{output_path}",
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            self.cropped_image_analysis_button.setEnabled(True)
+            QMessageBox.critical(self, "Cropped batch analysis failed", str(error))
+
     def _delay_image_analysis_failed(self, message: str) -> None:
         self.summary.setText("Highest-intensity image analysis failed")
         self.selected_image_analysis_button.setEnabled(True)
@@ -577,6 +886,7 @@ class MainWindow(QMainWindow):
             and (
                 Path(url.toLocalFile()).is_dir()
                 or Path(url.toLocalFile()).suffix.lower() in VIDEO_SUFFIXES
+                or Path(url.toLocalFile()).suffix.lower() in IMAGE_SUFFIXES
             )
             for url in event.mimeData().urls()
         ):
@@ -606,6 +916,12 @@ class MainWindow(QMainWindow):
             self._start_video_import(videos)
         elif folders:
             self._load_folder(folders[0])
+        elif any(path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES for path in paths):
+            image_path = next(
+                path for path in paths
+                if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+            )
+            self.load_reference_image(image_path)
         else:
             event.ignore()
             return
@@ -614,6 +930,8 @@ class MainWindow(QMainWindow):
     def _load_folder(self, folder: Path) -> None:
         try:
             self.experiment = load_experiment(folder)
+            self._crop_reference_image_loaded = False
+            self._selected_signal_mask = None
             self._crop_view_origin = (0, 0)
             self._preview_stage = None
             self._clear_segment_scan_cache()
@@ -644,6 +962,24 @@ class MainWindow(QMainWindow):
             self.refresh_preview()
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Import failed", str(error))
+
+    def average_selected_frame_folders(self) -> None:
+        selected_root = QFileDialog.getExistingDirectory(
+            self, "Select the folder containing selected time-point folders"
+        )
+        if not selected_root:
+            return
+        try:
+            averaged_folder = average_selected_frame_folders(Path(selected_root))
+            self._averaged_selected_folder = averaged_folder
+            self.summary.setText(f"Averaged selected frames saved to: {averaged_folder}")
+            QMessageBox.information(
+                self,
+                "Selected frames averaged",
+                f"Created one averaged image per time point in:\n{averaged_folder}",
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            QMessageBox.critical(self, "Could not average selected frames", str(error))
 
     def settings(self) -> PipelineSettings:
         mode = "threshold" if self.mode.currentIndex() == 0 else "subtract"
@@ -688,6 +1024,45 @@ class MainWindow(QMainWindow):
         self.refresh_preview()
 
     def save_profile(self) -> None:
+        if self._crop_reference_image_loaded:
+            if self._selected_signal_mask is None:
+                QMessageBox.information(
+                    self,
+                    "Signal segment required",
+                    "Enable bright-segment detection and click the signal segment before saving.",
+                )
+                return
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save background profile",
+                "background_reference.npz",
+                "Background reference (*.npz)",
+            )
+            if not path:
+                return
+            profile_path = Path(path)
+            if profile_path.suffix.lower() != ".npz":
+                profile_path = profile_path.with_suffix(".npz")
+            try:
+                reference_background = estimate_reference_background(
+                    self.preview._source_image, self._selected_signal_mask
+                )
+                save_reference_profile(
+                    self._selected_signal_mask, reference_background, profile_path
+                )
+                self.reference_background = reference_background
+                self.reference_signal_mask = self._selected_signal_mask.copy()
+                self.subtract_saved_background_enabled.setEnabled(True)
+                self.apply_crop_enabled.setEnabled(self.batch_crop is not None)
+                self.summary.setText(f"Saved background profile: {profile_path.name}")
+                QMessageBox.information(
+                    self,
+                    "Background profile saved",
+                    f"Saved the selected signal and fitted background to:\n{profile_path}",
+                )
+            except (OSError, ValueError, np.linalg.LinAlgError) as error:
+                QMessageBox.warning(self, "Cannot save profile", str(error))
+            return
         if self.experiment is None or self.region_mask is None:
             QMessageBox.information(
                 self,
@@ -742,12 +1117,16 @@ class MainWindow(QMainWindow):
             return
         try:
             signal_mask, background_reference = load_reference_profile(Path(path))
-            if self.experiment is not None:
+            if self._crop_reference_image_loaded:
+                if signal_mask.shape != self.preview._source_image.shape:
+                    raise ValueError("Profile dimensions do not match the reference photo")
+            elif self.experiment is not None:
                 image_shape = next(iter(self.experiment.combined.values())).shape
                 if signal_mask.shape != image_shape:
                     raise ValueError("Profile dimensions do not match the currently loaded images")
-            self.reference_signal_mask = None
+            self.reference_signal_mask = signal_mask.copy()
             self.reference_background = background_reference
+            self._selected_signal_mask = signal_mask.copy()
             self.region_mask = None
             self.selected_segment = 0
             self.isolate_segment_enabled.setChecked(False)
@@ -755,6 +1134,8 @@ class MainWindow(QMainWindow):
             self.preview.set_reference_masks(None)
             self.use_reference_profile.setEnabled(True)
             self.use_reference_profile.setChecked(True)
+            self.subtract_saved_background_enabled.setEnabled(True)
+            self.preview.set_reference_masks(signal_mask)
             self.refresh_preview()
         except (OSError, ValueError, KeyError) as error:
             QMessageBox.warning(self, "Cannot load profile", str(error))
@@ -771,7 +1152,7 @@ class MainWindow(QMainWindow):
             spinbox.blockSignals(False)
         self.crop_selection_complete = True
         self.zero_outside_box.setEnabled(True)
-        self._crop_view_origin = (x0, y0)
+        self._crop_view_origin = (0, 0) if self._crop_reference_image_loaded else (x0, y0)
         self._clear_segment_scan_cache()
         self.refresh_preview()
 
@@ -789,6 +1170,9 @@ class MainWindow(QMainWindow):
             self.region_mask = None
         self.selected_segment = 0
         self._clear_segment_scan_cache()
+        if self._crop_reference_image_loaded:
+            self.refresh_reference_segments()
+            return
         self.refresh_preview()
 
     def _clear_segment_scan_cache(self) -> None:
@@ -809,6 +1193,17 @@ class MainWindow(QMainWindow):
         return float(image.mean()) + self.segment_offset.value()
 
     def select_segment(self, x: int, y: int) -> None:
+        if self._crop_reference_image_loaded:
+            if self._segment_scan_labels is None:
+                return
+            label = int(self._segment_scan_labels[y, x])
+            if not label:
+                return
+            self._selected_signal_mask = self._segment_scan_labels == label
+            self.selected_segment = label
+            self.preview.set_segment_labels(self._segment_scan_labels, label)
+            self.summary.setText("Signal segment selected. Save or upload a background profile.")
+            return
         if self.use_reference_profile.isChecked():
             self.use_reference_profile.setChecked(False)
         stage = self.stage_selector.currentText()
@@ -828,7 +1223,25 @@ class MainWindow(QMainWindow):
         self.selected_segment = label
         self.refresh_preview()
 
+    def refresh_reference_segments(self) -> None:
+        if not self._crop_reference_image_loaded:
+            return
+        image = self.preview._source_image
+        if self.scan_segments_enabled.isChecked():
+            self._segment_scan_labels = connected_component_labels(
+                image, float(image.mean()) + self.segment_offset.value()
+            )
+            self.preview.set_segment_labels(self._segment_scan_labels, self.selected_segment)
+            self.summary.setText("Click the bright segment to retain during intensity analysis.")
+        else:
+            self._segment_scan_labels = None
+            self.selected_segment = 0
+            self._selected_signal_mask = None
+            self.preview.set_segment_labels(None)
+
     def refresh_preview(self) -> None:
+        if self._crop_reference_image_loaded:
+            return
         if self.experiment is None or self.stage_selector.currentIndex() < 0:
             return
         stage = self.stage_selector.currentText()

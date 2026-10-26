@@ -9,7 +9,11 @@ from esi_kinetics.io import (
     discover_stages,
     analyze_delay_folders,
     analyze_delay_images,
+    analyze_delay_images_with_crop,
+    average_selected_frame_folders,
+    apply_crop_to_folder,
     export_delay_analysis,
+    export_delay_curve_analysis,
     _bright_frame_indices,
     export_results,
     extract_video_batch,
@@ -153,6 +157,145 @@ def test_delay_image_analysis_uses_one_unadjusted_image_per_filename_delay(tmp_p
 
     workbook_path = export_delay_analysis(rows, tmp_path / "single_image_results.xlsx")
     assert workbook_path.is_file()
+
+
+def test_delay_image_analysis_uses_fixed_crop_for_all_images(tmp_path: Path):
+    crop = Crop(1, 0, 3, 2)
+    Image.fromarray(np.array([[0, 5, 1, 0], [0, 9, 2, 0]], dtype=np.uint8)).save(
+        tmp_path / "2ms.png"
+    )
+    Image.fromarray(np.array([[0, 7, 3, 0], [0, 1, 4, 0]], dtype=np.uint8)).save(
+        tmp_path / "500us.png"
+    )
+
+    rows = analyze_delay_images_with_crop(tmp_path, crop)
+
+    assert [row["Time_Delay"] for row in rows] == [0.0005, 0.002]
+    assert [row["Mean_Intensity"] for row in rows] == [
+        3.75,
+        4.25,
+    ]
+
+
+def test_delay_image_analysis_applies_background_signal_mask_and_crop(tmp_path: Path):
+    image = np.full((4, 5), 10, dtype=np.uint8)
+    image[1, 2] = 30
+    image[1, 3] = 50
+    Image.fromarray(image).save(tmp_path / "sample_500us.png")
+    background = np.full((4, 5), 10, dtype=np.float64)
+    signal_mask = np.zeros((4, 5), dtype=bool)
+    signal_mask[1, 2:4] = True
+
+    rows = analyze_delay_images_with_crop(
+        tmp_path,
+        Crop(2, 1, 3, 2),
+        background_reference=background,
+        signal_mask=signal_mask,
+    )
+
+    assert rows[0]["Mean_Intensity"] == 20.0
+
+
+def test_average_selected_frame_folders_writes_one_average_per_timepoint(tmp_path: Path):
+    selected = tmp_path / "Selected Time Points"
+    first = selected / "sample_500us Selected Time Points"
+    second = selected / "sample_2ms Selected Time Points"
+    first.mkdir(parents=True)
+    second.mkdir()
+    Image.fromarray(np.array([[10, 20], [30, 40]], dtype=np.uint8)).save(first / "a.png")
+    Image.fromarray(np.array([[20, 30], [40, 50]], dtype=np.uint8)).save(first / "b.png")
+    Image.fromarray(np.full((2, 2), 70, dtype=np.uint8)).save(second / "a.png")
+
+    output = average_selected_frame_folders(selected)
+
+    assert output.name == "Averaged Selected Frames"
+    assert sorted(path.name for path in output.glob("*.png")) == [
+        "sample_2ms Selected Time Points.png",
+        "sample_500us Selected Time Points.png",
+    ]
+    averaged = np.asarray(Image.open(output / "sample_500us Selected Time Points.png"))
+    np.testing.assert_array_equal(averaged, np.array([[15, 25], [35, 45]], dtype=np.uint8))
+
+
+def test_delay_image_analysis_falls_back_to_folder_delay_name_when_image_names_are_generic(tmp_path: Path):
+    crop = Crop(1, 0, 3, 2)
+    first = tmp_path / "2 ms"
+    second = tmp_path / "500 us"
+    first.mkdir()
+    second.mkdir()
+    Image.fromarray(np.array([[0, 5, 1, 0], [0, 9, 2, 0]], dtype=np.uint8)).save(
+        first / "selected.png"
+    )
+    Image.fromarray(np.array([[0, 7, 3, 0], [0, 1, 4, 0]], dtype=np.uint8)).save(
+        second / "selected.png"
+    )
+
+    rows = analyze_delay_images_with_crop(tmp_path, crop)
+
+    assert [row["Time_Delay"] for row in rows] == [0.0005, 0.002]
+    assert [row["Mean_Intensity"] for row in rows] == [3.75, 4.25]
+
+
+def test_delay_image_analysis_handles_nested_delay_folders(tmp_path: Path):
+    crop = Crop(1, 0, 3, 2)
+    container = tmp_path / "selected"
+    first = container / "2 ms"
+    second = container / "500 us"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    Image.fromarray(np.array([[0, 5, 1, 0], [0, 9, 2, 0]], dtype=np.uint8)).save(
+        first / "selected.png"
+    )
+    Image.fromarray(np.array([[0, 7, 3, 0], [0, 1, 4, 0]], dtype=np.uint8)).save(
+        second / "selected.png"
+    )
+
+    rows = analyze_delay_images_with_crop(container, crop)
+
+    assert [row["Time_Delay"] for row in rows] == [0.0005, 0.002]
+    assert [row["Mean_Intensity"] for row in rows] == [3.75, 4.25]
+
+
+def test_apply_crop_to_folder_writes_cropped_images(tmp_path: Path):
+    source = tmp_path / "uncropped"
+    source.mkdir()
+    crop = Crop(1, 0, 3, 2)
+    Image.fromarray(np.array([[0, 5, 1, 0], [0, 9, 2, 0]], dtype=np.uint8)).save(
+        source / "a.png"
+    )
+    output = apply_crop_to_folder(source, crop)
+
+    cropped = np.asarray(Image.open(output / "a.png").convert("L"), dtype=np.uint8)
+    assert cropped.shape == (2, 2)
+    np.testing.assert_array_equal(cropped, np.array([[5, 1], [9, 2]], dtype=np.uint8))
+
+
+def test_export_delay_curve_analysis_writes_time_intensity_and_ln_columns(tmp_path: Path):
+    rows = [
+        {"Time_Delay": 0.0005, "Mean_Intensity": 10.0},
+        {"Time_Delay": 0.002, "Mean_Intensity": 20.0},
+    ]
+
+    workbook_path = export_delay_curve_analysis(rows, tmp_path / "curve.xlsx")
+
+    import zipfile
+
+    with zipfile.ZipFile(workbook_path) as workbook:
+        assert not any(name.startswith("xl/charts/") for name in workbook.namelist())
+        shared_strings = workbook.read("xl/sharedStrings.xml").decode("utf-8")
+        assert "Time_Delay_ms" in shared_strings
+        assert "Intensity" in shared_strings
+        assert "Ln_Intensity" in shared_strings
+        import xml.etree.ElementTree as ET
+
+        sheet = ET.fromstring(workbook.read("xl/worksheets/sheet1.xml"))
+        namespace = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        cell_values = {
+            cell.attrib["r"]: float(cell.findtext("x:v", namespaces=namespace))
+            for cell in sheet.findall(".//x:c", namespace)
+            if cell.attrib.get("r") in {"A2", "A3"}
+        }
+        assert cell_values == {"A2": 0.5, "A3": 2.0}
 
 
 def test_parse_time_delay_requires_unit():
