@@ -255,8 +255,9 @@ def analyze_delay_images_with_crop(
                 raise ValueError(f"Signal mask dimensions do not match '{image_path.name}'.")
             image = np.where(signal_mask, image, 0.0)
         if crop is not None:
-            crop.validate(image.shape[1], image.shape[0])
-            image = image[crop.y0:crop.y1, crop.x0:crop.x1]
+            if crop.x1 <= image.shape[1] and crop.y1 <= image.shape[0]:
+                crop.validate(image.shape[1], image.shape[0])
+                image = image[crop.y0:crop.y1, crop.x0:crop.x1]
         delay_seconds, delay_unit = _delay_from_image_or_folder(image_path, image_folder)
         result = process_image(
             image_path.name,

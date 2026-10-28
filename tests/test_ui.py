@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 from PIL import Image
 from PySide6.QtWidgets import QApplication
@@ -101,6 +103,27 @@ def test_imported_reference_image_preview_preserves_png_brightness(monkeypatch):
     window.close()
 
 
+def test_saved_crop_persists_when_loading_a_new_reference_photo(monkeypatch):
+    first = np.zeros((40, 60), dtype=np.float64)
+    second = np.ones((40, 60), dtype=np.float64)
+
+    def fake_read_image(path):
+        return first if "first" in str(path) else second
+
+    monkeypatch.setattr("esi_kinetics.ui.read_image", fake_read_image)
+    window = MainWindow()
+    window.load_reference_image(Path("first.png"))
+    window.batch_crop = Crop(10, 12, 25, 30)
+    window.show_crop_overlay.setChecked(True)
+    window.load_reference_image(Path("second.png"))
+
+    assert window.batch_crop == Crop(10, 12, 25, 30)
+    assert not window.apply_crop_enabled.isChecked()
+    assert window.show_crop_overlay.isChecked()
+    assert window.preview._selection == (10, 12, 25, 30)
+    window.close()
+
+
 def test_saved_crop_zooms_preview_and_hiding_restores_full_photo():
     window = MainWindow()
     window.preview.set_image(np.zeros((200, 300), dtype=np.float64))
@@ -175,4 +198,92 @@ def test_final_analysis_requires_both_options_and_exports_averaged_folder(tmp_pa
     assert workbook.is_file()
     assert dialogs == ["folder", "save"]
     assert "1 time delays" in window.summary.text()
+    window.close()
+
+
+def test_reset_clears_saved_crop_and_background_state():
+    window = MainWindow()
+    window.batch_crop = Crop(10, 20, 30, 40)
+    window.reference_background = np.ones((10, 10), dtype=np.float64)
+    window.reference_signal_mask = np.ones((10, 10), dtype=bool)
+    window._selected_signal_mask = np.ones((10, 10), dtype=bool)
+    window._crop_reference_image_loaded = True
+    window.apply_crop_enabled.setChecked(True)
+    window.apply_crop_enabled.setEnabled(True)
+    window.subtract_saved_background_enabled.setChecked(True)
+    window.subtract_saved_background_enabled.setEnabled(True)
+    window.show_crop_overlay.setChecked(True)
+    window.experiment = object()
+
+    window.reset()
+
+    assert window.batch_crop is None
+    assert not window.apply_crop_enabled.isChecked()
+    assert not window.apply_crop_enabled.isEnabled()
+    assert not window.subtract_saved_background_enabled.isChecked()
+    assert not window.subtract_saved_background_enabled.isEnabled()
+    assert window.reference_background is None
+    assert window._selected_signal_mask is None
+    assert not window._crop_reference_image_loaded
+    assert window.experiment is None
+    window.close()
+
+
+def test_delete_outside_crop_clears_pixels_around_selection_and_saves_crop(tmp_path, monkeypatch):
+    window = MainWindow()
+    image = np.arange(100, dtype=np.float64).reshape(10, 10)
+    window.preview.set_image(image)
+    window._crop_reference_image_loaded = True
+    window.batch_crop = Crop(2, 2, 6, 6)
+
+    window.delete_outside_crop()
+
+    assert np.all(window.preview._source_image[:2, :] == 0)
+    assert np.all(window.preview._source_image[2:6, 2:6] > 0)
+
+    output_path = tmp_path / "cropped_reference.png"
+    monkeypatch.setattr(
+        "esi_kinetics.ui.QFileDialog.getSaveFileName",
+        lambda *args: (str(output_path), ""),
+    )
+    window.save_cropped_reference_image()
+
+    assert output_path.exists()
+    assert output_path.stat().st_size > 0
+    window.close()
+
+
+def test_saved_photo_subtracts_full_size_background_then_applies_optional_crop(tmp_path, monkeypatch):
+    source = np.array(
+        [[10, 20, 30], [40, 50, 60], [70, 80, 90]],
+        dtype=np.float64,
+    )
+    background = np.full((3, 3), 10, dtype=np.float64)
+    window = MainWindow()
+    window.preview.set_image(source, display_max=255.0)
+    window._crop_reference_image_loaded = True
+    window.batch_crop = Crop(1, 1, 3, 3)
+    window.uploaded_background_image = background
+    window.show_crop_overlay.setChecked(True)
+    output_path = tmp_path / "cropped_with_background.png"
+    monkeypatch.setattr(
+        "esi_kinetics.ui.QFileDialog.getSaveFileName",
+        lambda *args: (str(output_path), ""),
+    )
+    monkeypatch.setattr("esi_kinetics.ui.QMessageBox.information", lambda *args: None)
+
+    window.save_cropped_reference_image()
+
+    with Image.open(output_path) as saved:
+        saved_array = np.asarray(saved.convert("L"))
+    assert saved_array.shape == source.shape
+    assert np.array_equal(saved_array, np.array([[0, 0, 0], [0, 40, 50], [0, 70, 80]]))
+    assert np.array_equal(window.preview._source_image, source)
+
+    window.show_crop_overlay.setChecked(False)
+    output_path = tmp_path / "background_only.png"
+    window.save_cropped_reference_image()
+    with Image.open(output_path) as saved:
+        saved_array = np.asarray(saved.convert("L"))
+    assert np.array_equal(saved_array, source - background)
     window.close()

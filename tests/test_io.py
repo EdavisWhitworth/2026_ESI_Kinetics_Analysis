@@ -196,6 +196,19 @@ def test_delay_image_analysis_applies_background_signal_mask_and_crop(tmp_path: 
     assert rows[0]["Mean_Intensity"] == 20.0
 
 
+def test_delay_image_analysis_skips_overlarge_crop_for_already_cropped_images(tmp_path: Path):
+    Image.fromarray(np.array([[10, 20], [30, 40]], dtype=np.uint8)).save(
+        tmp_path / "2ms.png"
+    )
+    Image.fromarray(np.array([[5, 15], [25, 35]], dtype=np.uint8)).save(
+        tmp_path / "500us.png"
+    )
+
+    rows = analyze_delay_images_with_crop(tmp_path, Crop(0, 0, 10, 10))
+
+    assert [row["Mean_Intensity"] for row in rows] == [20.0, 25.0]
+
+
 def test_average_selected_frame_folders_writes_one_average_per_timepoint(tmp_path: Path):
     selected = tmp_path / "Selected Time Points"
     first = selected / "sample_500us Selected Time Points"

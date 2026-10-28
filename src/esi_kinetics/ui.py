@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 from PySide6.QtCore import QRect, Qt, QThread, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import (
@@ -113,6 +114,9 @@ class ImagePreview(QWidget):
         self._drag_start = None
         self._drag_current = None
         self._crop_mode = False
+        self._selection_dragging = False
+        self._selection_drag_origin = None
+        self._selection_drag_start = None
         self._segment_labels = None
         self._selected_segment = 0
         self._reference_signal_mask = None
@@ -250,6 +254,17 @@ class ImagePreview(QWidget):
                 self.segmentSelected.emit(x, y)
                 event.accept()
                 return
+        if (event.button() == Qt.MouseButton.LeftButton and image_rect.contains(point)):
+            x, y = self._image_point(point)
+            if (self._selection is not None and self._selection_visible and not self._crop_mode
+                    and self._selection[0] <= x <= self._selection[2] and self._selection[1] <= y <= self._selection[3]):
+                self._selection_dragging = True
+                self._selection_drag_origin = (x, y)
+                self._selection_drag_start = self._selection
+                self.grabMouse()
+                self.update()
+                event.accept()
+                return
         if (self._crop_mode and event.button() == Qt.MouseButton.LeftButton
                 and image_rect.contains(point)):
             self._image_rect = image_rect
@@ -265,6 +280,26 @@ class ImagePreview(QWidget):
         event.ignore()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._selection_dragging and self._selection_drag_start is not None:
+            current = self._image_point(event.position().toPoint())
+            dx = current[0] - self._selection_drag_origin[0]
+            dy = current[1] - self._selection_drag_origin[1]
+            x0, y0, x1, y1 = self._selection_drag_start
+            width = x1 - x0
+            height = y1 - y0
+            max_x = max(0, self._source_image.shape[1] - width)
+            max_y = max(0, self._source_image.shape[0] - height)
+            translated_x0 = min(max(0, x0 + dx), max_x)
+            translated_y0 = min(max(0, y0 + dy), max_y)
+            self._selection = (
+                translated_x0,
+                translated_y0,
+                translated_x0 + width,
+                translated_y0 + height,
+            )
+            self.update()
+            event.accept()
+            return
         if self._crop_mode and self._drag_start:
             current = self._image_point(event.position().toPoint())
             self._drag_current = self._normalized_selection(self._drag_start, current)
@@ -274,6 +309,16 @@ class ImagePreview(QWidget):
         event.ignore()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._selection_dragging and event.button() == Qt.MouseButton.LeftButton:
+            self._selection_dragging = False
+            self._selection_drag_origin = None
+            self._selection_drag_start = None
+            self.releaseMouse()
+            if self._selection is not None:
+                self.cropSelected.emit(*self._selection)
+            self.update()
+            event.accept()
+            return
         if self._crop_mode and event.button() == Qt.MouseButton.LeftButton and self._drag_start:
             selection = self._normalized_selection(self._drag_start, self._image_point(event.position().toPoint()))
             self._drag_start = None
@@ -334,14 +379,17 @@ class MainWindow(QMainWindow):
         self._delay_analysis_worker = None
         self._delay_image_analysis_worker = None
         self.batch_crop: Crop | None = None
+        self.uploaded_background_image: np.ndarray | None = None
+        self.uploaded_background_path: Path | None = None
         self._crop_view_origin = (0, 0)
         self._crop_reference_image_loaded = False
         self._crop_reference_path: Path | None = None
+        self._reference_photo_original: np.ndarray | None = None
         self._selected_signal_mask: np.ndarray | None = None
         self._background_subtraction_enabled = False
         self._averaged_selected_folder: Path | None = None
         self._preview_stage = None
-        self.show_crop_overlay = QCheckBox("Highlight saved crop")
+        self.show_crop_overlay = QCheckBox("Use saved crop for all following photos")
         self.apply_crop_enabled = QCheckBox("Apply saved crop")
         self.apply_crop_enabled.setEnabled(False)
         self.subtract_saved_background_enabled = QCheckBox("Subtract saved background")
@@ -407,8 +455,6 @@ class MainWindow(QMainWindow):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        import_button = QPushButton("Import image folder")
-        import_button.clicked.connect(self.import_folder)
         import_video_button = QPushButton("Import videos (select multiple)")
         import_video_button.clicked.connect(self.import_video)
         self.import_video_button = import_video_button
@@ -418,75 +464,27 @@ class MainWindow(QMainWindow):
         average_selected_frames_button = QPushButton("Average selected frame folders")
         average_selected_frames_button.clicked.connect(self.average_selected_frame_folders)
         self.average_selected_frames_button = average_selected_frames_button
-        batch_analysis_button = QPushButton("Analyze delay folders")
-        batch_analysis_button.clicked.connect(self.analyze_delay_folders)
-        self.batch_analysis_button = batch_analysis_button
-        save_batch_crop_button = QPushButton("Save batch crop")
-        save_batch_crop_button.clicked.connect(self.save_batch_crop)
-        self.save_batch_crop_button = save_batch_crop_button
-        apply_crop_folder_button = QPushButton("Apply crop to image folder")
-        apply_crop_folder_button.clicked.connect(self.apply_crop_to_image_folder)
-        self.apply_crop_folder_button = apply_crop_folder_button
-        selected_image_analysis_button = QPushButton("Analyze highest-intensity images")
-        selected_image_analysis_button.clicked.connect(self.analyze_delay_images)
-        self.selected_image_analysis_button = selected_image_analysis_button
-        cropped_image_analysis_button = QPushButton("Analyze averaged selected frames")
-        cropped_image_analysis_button.clicked.connect(self.analyze_cropped_delay_images)
-        self.cropped_image_analysis_button = cropped_image_analysis_button
-        export_button = QPushButton("Export results")
-        export_button.clicked.connect(self.export)
-        reset_button = QPushButton("Reset processing")
+        self.cropped_image_analysis_button = QPushButton("Analyze averaged selected frames")
+        self.cropped_image_analysis_button.clicked.connect(self.analyze_cropped_delay_images)
+        reset_button = QPushButton("Reset")
         reset_button.clicked.connect(self.reset)
-        save_profile_button = QPushButton("Save background image")
-        save_profile_button.clicked.connect(self.save_profile)
-        load_profile_button = QPushButton("Load background image")
-        load_profile_button.clicked.connect(self.load_profile)
-        self.save_profile_button = save_profile_button
-        self.load_profile_button = load_profile_button
-
-        old_controls_layout = QFormLayout()
-        old_controls_layout.addRow(import_button)
-        old_controls_layout.addRow(import_video_button)
-        old_controls_layout.addRow(batch_analysis_button)
-        old_controls_layout.addRow(selected_image_analysis_button)
-        old_controls_layout.addRow(save_batch_crop_button)
-        old_controls_layout.addRow(cropped_image_analysis_button)
-        old_controls_layout.addRow("Stage", self.stage_selector)
-        old_controls_layout.addRow(self.combine_enabled)
-        old_controls_layout.addRow(self.crop_enabled)
-        old_controls_layout.addRow("Crop x0 / x1", self._pair(self.x0, self.x1))
-        old_controls_layout.addRow("Crop y0 / y1", self._pair(self.y0, self.y1))
-        old_controls_layout.addRow(self.zero_outside_box)
-        old_controls_layout.addRow(self.background_enabled)
-        old_controls_layout.addRow(self.connected_region_enabled)
-        old_controls_layout.addRow(self.scan_segments_enabled)
-        old_controls_layout.addRow("Segment brightness above average", self.segment_offset)
-        old_controls_layout.addRow(self.isolate_segment_enabled)
-        old_controls_layout.addRow(self.use_reference_profile)
-        old_controls_layout.addRow(self._pair(save_profile_button, load_profile_button))
-        old_controls_layout.addRow("Background mode", self.mode)
-        old_controls_layout.addRow("Threshold", self.threshold)
-        old_controls_layout.addRow("Background value", self.background)
-        old_controls_layout.addRow("Preview contrast", self.contrast)
-        old_controls_layout.addRow(reset_button)
-        old_controls_layout.addRow(export_button)
-
-        new_controls_layout = QFormLayout()
-        new_controls_layout.addRow("1. Upload video files", import_video_button)
-        new_controls_layout.addRow("2. Average selected frame folders", average_selected_frames_button)
-        new_controls_layout.addRow("3. Reference photo", import_selected_image_button)
-        new_controls_layout.addRow("Draw crop", self.crop_enabled)
-        new_controls_layout.addRow(save_batch_crop_button)
-        new_controls_layout.addRow(self.show_crop_overlay)
-        new_controls_layout.addRow("Find bright segments", self.scan_segments_enabled)
-        new_controls_layout.addRow("Segment threshold above mean", self.segment_offset)
-        new_controls_layout.addRow(self._pair(save_profile_button, load_profile_button))
-        new_controls_layout.addRow("4. Apply crop to analysis", self.apply_crop_enabled)
-        new_controls_layout.addRow(
-            "Subtract uploaded background profile", self.subtract_saved_background_enabled
-        )
-        new_controls_layout.addRow("5. Analyze averaged selected frames", cropped_image_analysis_button)
-        new_controls_layout.addRow("Preview contrast", self.contrast)
+        delete_outside_crop_button = QPushButton("Delete outside crop")
+        delete_outside_crop_button.clicked.connect(self.delete_outside_crop)
+        upload_background_button = QPushButton("Upload background image")
+        upload_background_button.clicked.connect(self.upload_background_image)
+        save_cropped_reference_button = QPushButton("Save cropped photo")
+        save_cropped_reference_button.clicked.connect(self.save_cropped_reference_image)
+        analyze_saved_folder_button = QPushButton("Analyze saved cropped folder")
+        analyze_saved_folder_button.clicked.connect(self.analyze_saved_cropped_photo_folder)
+        controls_layout = QFormLayout()
+        controls_layout.addRow("1. Upload video files", import_video_button)
+        controls_layout.addRow("2. Average selected frame folders", average_selected_frames_button)
+        controls_layout.addRow("3. Reference photo upload and crop", import_selected_image_button)
+        controls_layout.addRow(self.show_crop_overlay)
+        controls_layout.addRow(delete_outside_crop_button)
+        controls_layout.addRow("4. Upload background", upload_background_button)
+        controls_layout.addRow("5. Save cropped photo", save_cropped_reference_button)
+        controls_layout.addRow("6. Analyze saved cropped folder", analyze_saved_folder_button)
 
         self.crop_enabled.stateChanged.connect(self.crop_mode_changed)
         self.show_crop_overlay.stateChanged.connect(self.update_crop_overlay)
@@ -504,27 +502,11 @@ class MainWindow(QMainWindow):
             widget.valueChanged.connect(self.refresh_preview)
         self.summary.setWordWrap(True)
 
-        old_controls_widget = QWidget()
-        old_controls_widget.setLayout(old_controls_layout)
-        new_controls_widget = QWidget()
-        new_controls_widget.setLayout(new_controls_layout)
-
-        header = QWidget()
-        header_layout = QHBoxLayout(header)
-        header_layout.addWidget(QLabel("Controls mode"))
-        header_layout.addWidget(self.control_mode)
-        header_layout.setContentsMargins(0, 0, 0, 0)
-
         left = QWidget()
         left_layout = QVBoxLayout(left)
-        left_layout.addWidget(header)
-        control_stack = QStackedWidget()
-        control_stack.addWidget(new_controls_widget)
-        control_stack.addWidget(old_controls_widget)
-        self.control_stack = control_stack
-        self.control_mode.currentIndexChanged.connect(control_stack.setCurrentIndex)
-        left_layout.addWidget(control_stack)
-        left_layout.addWidget(self.summary)
+        left_layout.addLayout(controls_layout)
+        left_layout.addWidget(reset_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        left_layout.addStretch(1)
 
         control_scroll = QScrollArea()
         control_scroll.setWidgetResizable(True)
@@ -727,14 +709,34 @@ class MainWindow(QMainWindow):
             return
         self.load_reference_image(Path(path))
 
+    def upload_background_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select background image",
+            "",
+            "Image files (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)",
+        )
+        if not path:
+            return
+        try:
+            background = read_image(Path(path))
+            if self.preview._source_image.size and background.shape != self.preview._source_image.shape:
+                raise ValueError("Background image dimensions must match the reference photo")
+            self.uploaded_background_image = background
+            self.uploaded_background_path = Path(path)
+            self.summary.setText(f"Background uploaded: {Path(path).name}")
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Cannot upload background", str(error))
+
     def load_reference_image(self, image_path: Path) -> None:
         image = read_image(image_path)
+        saved_crop = self.batch_crop
         self._crop_reference_image_loaded = True
         self._crop_reference_path = image_path
+        self._reference_photo_original = image.copy()
         self._selected_signal_mask = None
         self._segment_scan_labels = None
-        self.batch_crop = None
-        self.crop_selection_complete = False
+        self.crop_selection_complete = saved_crop is not None
         self.reference_background = None
         self.reference_signal_mask = None
         self.subtract_saved_background_enabled.setChecked(False)
@@ -742,7 +744,10 @@ class MainWindow(QMainWindow):
         self.apply_crop_enabled.setChecked(False)
         self.apply_crop_enabled.setEnabled(False)
         self.crop_enabled.setChecked(True)
-        self.show_crop_overlay.setChecked(False)
+        if saved_crop is not None:
+            self.batch_crop = Crop(saved_crop.x0, saved_crop.y0, saved_crop.x1, saved_crop.y1)
+        else:
+            self.batch_crop = None
         height, width = image.shape[:2]
         for spinbox, maximum, value in (
             (self.x0, width, 0),
@@ -752,6 +757,11 @@ class MainWindow(QMainWindow):
         ):
             spinbox.setRange(0, maximum)
             spinbox.setValue(value)
+        if saved_crop is not None:
+            self.x0.setValue(saved_crop.x0)
+            self.y0.setValue(saved_crop.y0)
+            self.x1.setValue(saved_crop.x1)
+            self.y1.setValue(saved_crop.y1)
         self._crop_view_origin = (0, 0)
         self._preview_stage = None
         self.preview.set_reference_masks(None)
@@ -759,6 +769,18 @@ class MainWindow(QMainWindow):
         self.preview.set_crop_mode(True)
         self.preview.set_image(image, display_max=255.0)
         self.preview.set_contrast(self.contrast.value())
+        if self.batch_crop is not None and self.show_crop_overlay.isChecked():
+            self.preview.set_crop_mode(False)
+            self.preview.set_selection(
+                self.batch_crop.x0,
+                self.batch_crop.y0,
+                self.batch_crop.x1,
+                self.batch_crop.y1,
+            )
+            self.preview.set_selection_visible(True)
+        else:
+            self.preview.set_selection_visible(False)
+            self.preview.set_crop_mode(True)
         self.summary.setText(f"Selected frame ready for crop: {image_path.name}")
         self.refresh_reference_segments()
 
@@ -1146,15 +1168,138 @@ class MainWindow(QMainWindow):
         x1 += origin_x
         y0 += origin_y
         y1 += origin_y
+        if x1 <= x0:
+            x0, x1 = x1, x0
+        if y1 <= y0:
+            y0, y1 = y1, y0
+        self.batch_crop = Crop(x0, y0, x1, y1)
         for spinbox, value in ((self.x0, x0), (self.y0, y0), (self.x1, x1), (self.y1, y1)):
             spinbox.blockSignals(True)
             spinbox.setValue(value)
             spinbox.blockSignals(False)
         self.crop_selection_complete = True
         self.zero_outside_box.setEnabled(True)
+        self.crop_enabled.setChecked(False)
+        self.preview.set_crop_mode(False)
+        self.preview.set_selection(x0, y0, x1, y1)
+        self.preview.set_selection_visible(self.show_crop_overlay.isChecked())
         self._crop_view_origin = (0, 0) if self._crop_reference_image_loaded else (x0, y0)
         self._clear_segment_scan_cache()
         self.refresh_preview()
+
+    def delete_outside_crop(self) -> None:
+        if self.batch_crop is None:
+            QMessageBox.information(
+                self,
+                "No crop selected",
+                "Draw or save a crop before deleting pixels outside it.",
+            )
+            return
+        image = self.preview._source_image.copy()
+        crop = self.batch_crop
+        image[:crop.y0, :] = 0.0
+        image[crop.y1:, :] = 0.0
+        image[:, :crop.x0] = 0.0
+        image[:, crop.x1:] = 0.0
+        self.preview._source_image = image
+        self.preview._render_image()
+        self.preview.update()
+        self.summary.setText(f"Pixels outside the saved crop were cleared at {crop.x0}, {crop.y0} to {crop.x1}, {crop.y1}.")
+
+    def save_cropped_reference_image(self) -> None:
+        if self.preview._source_image.size == 0:
+            QMessageBox.information(
+                self,
+                "No image loaded",
+                "Load a reference photo before saving the cropped version.",
+            )
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save cropped reference image",
+            "cropped_reference.png",
+            "Image files (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)",
+        )
+        if not path:
+            return
+        output_path = Path(path)
+        if output_path.suffix.lower() not in IMAGE_SUFFIXES:
+            output_path = output_path.with_suffix(".png")
+        image = self.preview._source_image.astype(np.float64, copy=True)
+        if self.uploaded_background_image is not None:
+            if self.uploaded_background_image.shape != image.shape:
+                QMessageBox.warning(
+                    self,
+                    "Background dimensions do not match",
+                    "Upload a background image with the same dimensions as the reference photo.",
+                )
+                return
+            image = np.maximum(image - self.uploaded_background_image, 0.0)
+        if self.show_crop_overlay.isChecked():
+            if self.batch_crop is None:
+                QMessageBox.information(
+                    self,
+                    "No saved crop",
+                    "Draw a crop and check 'Use saved crop for all following photos' before saving.",
+                )
+                return
+            crop = self.batch_crop
+            try:
+                crop.validate(image.shape[1], image.shape[0])
+            except ValueError as error:
+                QMessageBox.warning(self, "Crop does not fit photo", str(error))
+                return
+            outside_crop = np.ones(image.shape, dtype=bool)
+            outside_crop[crop.y0:crop.y1, crop.x0:crop.x1] = False
+            image[outside_crop] = 0.0
+        image = np.clip(image, 0.0, 255.0)
+        Image.fromarray(image.astype(np.uint8)).save(output_path)
+        self.summary.setText(f"Saved cropped reference image: {output_path.name}")
+        QMessageBox.information(
+            self,
+            "Cropped photo saved",
+            f"Saved the current cropped reference image to:\n{output_path}",
+        )
+
+    def analyze_saved_cropped_photo_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Select the folder of saved cropped photos")
+        if not folder:
+            return
+        default_path = str(Path(folder).parent / "cropped_photo_analysis.xlsx")
+        workbook_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save cropped photo folder workbook",
+            default_path,
+            "Excel workbook (*.xlsx)",
+        )
+        if not workbook_path:
+            return
+        output_path = Path(workbook_path)
+        if output_path.suffix.lower() != ".xlsx":
+            output_path = output_path.with_suffix(".xlsx")
+        try:
+            crop = self.batch_crop
+            candidate_shape = None
+            if self.preview._source_image.size:
+                candidate_shape = self.preview._source_image.shape
+            if crop is not None and candidate_shape is not None:
+                if crop.x1 > candidate_shape[1] or crop.y1 > candidate_shape[0]:
+                    crop = None
+            rows = analyze_delay_images_with_crop(
+                Path(folder),
+                crop=crop,
+                background_reference=self.reference_background,
+                signal_mask=self._selected_signal_mask,
+            ) if (crop is not None or self.reference_background is not None or self._selected_signal_mask is not None) else analyze_delay_images(Path(folder))
+            export_delay_curve_analysis(rows, output_path)
+            self.summary.setText(f"Saved cropped photo workbook: {output_path.name}")
+            QMessageBox.information(
+                self,
+                "Cropped photo analysis complete",
+                f"Analyzed {len(rows)} cropped photos and saved the workbook to:\n{output_path}",
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            QMessageBox.critical(self, "Cropped photo analysis failed", str(error))
 
     def crop_mode_changed(self) -> None:
         self.crop_selection_complete = False
@@ -1303,7 +1448,31 @@ class MainWindow(QMainWindow):
             self.preview.set_crop_mode(True)
 
     def reset(self) -> None:
+        if self._reference_photo_original is not None:
+            self.preview.set_image(self._reference_photo_original, display_max=255.0)
+        self.experiment = None
+        self.results = []
+        self.reference_background = None
+        self.reference_signal_mask = None
+        self._selected_signal_mask = None
+        self._crop_reference_image_loaded = False
+        self._crop_reference_path = None
+        self._reference_photo_original = None
+        self.batch_crop = None
+        self.uploaded_background_image = None
+        self.uploaded_background_path = None
+        self._crop_view_origin = (0, 0)
+        self.crop_selection_complete = False
+        self._preview_stage = None
+        self.region_mask = None
+        self.selected_segment = 0
+        self._clear_segment_scan_cache()
+        self.stage_selector.blockSignals(True)
+        self.stage_selector.clear()
+        self.stage_selector.blockSignals(False)
+
         self.crop_enabled.setChecked(False)
+        self.show_crop_overlay.setChecked(False)
         self.zero_outside_box.setChecked(False)
         self.zero_outside_box.setEnabled(False)
         self.background_enabled.setChecked(True)
@@ -1311,18 +1480,31 @@ class MainWindow(QMainWindow):
         self.scan_segments_enabled.setChecked(False)
         self.segment_offset.setValue(0)
         self.isolate_segment_enabled.setChecked(False)
+        self.use_reference_profile.blockSignals(True)
         self.use_reference_profile.setChecked(False)
-        self.region_mask = None
-        self.selected_segment = 0
-        self._clear_segment_scan_cache()
+        self.use_reference_profile.setEnabled(False)
+        self.use_reference_profile.blockSignals(False)
+        self.apply_crop_enabled.setChecked(False)
+        self.apply_crop_enabled.setEnabled(False)
+        self.subtract_saved_background_enabled.setChecked(False)
+        self.subtract_saved_background_enabled.setEnabled(False)
         self.mode.setCurrentIndex(0)
         self.threshold.setValue(0)
         self.background.setValue(0)
         self.contrast.setValue(1.0)
+        self.combine_enabled.setChecked(True)
         self.x0.setValue(0)
         self.y0.setValue(0)
         self.x1.setValue(self.x1.maximum())
         self.y1.setValue(self.y1.maximum())
+
+        self.preview.set_selection_visible(False)
+        self.preview.set_crop_mode(False)
+        self.preview.set_reference_masks(None)
+        self.preview.set_segment_labels(None)
+        self.preview.set_view_full()
+        self.summary.setText("No experiment loaded")
+        self._update_background_controls()
         self.refresh_preview()
 
     def export(self) -> None:
