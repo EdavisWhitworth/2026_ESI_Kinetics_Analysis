@@ -10,6 +10,7 @@ from esi_kinetics.io import (
     analyze_delay_folders,
     analyze_delay_images,
     analyze_delay_images_with_crop,
+    analyze_full_image_intensity,
     average_selected_frame_folders,
     apply_crop_to_folder,
     export_delay_analysis,
@@ -175,6 +176,16 @@ def test_delay_image_analysis_uses_fixed_crop_for_all_images(tmp_path: Path):
         3.75,
         4.25,
     ]
+
+
+def test_full_image_intensity_sums_all_pixels_without_crop_or_background(tmp_path: Path):
+    image = np.array([[100, 80], [0, 0]], dtype=np.uint8)
+    Image.fromarray(image).save(tmp_path / "sample_500us.png")
+
+    rows = analyze_full_image_intensity(tmp_path)
+
+    assert rows[0]["Intensity"] == 180.0
+    assert rows[0]["Time_Delay"] == 0.0005
 
 
 def test_delay_image_analysis_applies_background_signal_mask_and_crop(tmp_path: Path):

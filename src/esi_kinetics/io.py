@@ -231,6 +231,25 @@ def analyze_delay_images(image_folder: Path) -> list[dict[str, object]]:
     return sorted(rows, key=lambda row: float(row["Time_Delay"]))
 
 
+def analyze_full_image_intensity(image_folder: Path) -> list[dict[str, object]]:
+    image_paths = _iter_image_paths(image_folder)
+    if not image_paths:
+        raise ValueError("No supported image files were found in the selected folder.")
+
+    rows = []
+    for image_path in image_paths:
+        image = read_image(image_path)
+        delay_seconds, delay_unit = _delay_from_image_or_folder(image_path, image_folder)
+        rows.append({
+            "Folder": image_path.stem,
+            "Time_Delay": delay_seconds,
+            "Time_Unit_In_Title": delay_unit,
+            "Intensity": float(np.sum(image, dtype=np.float64)),
+            "Images_Averaged": 1,
+        })
+    return sorted(rows, key=lambda row: float(row["Time_Delay"]))
+
+
 def analyze_delay_images_with_crop(
     image_folder: Path,
     crop: Crop | None = None,

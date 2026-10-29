@@ -2,7 +2,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPushButton
 
 from esi_kinetics.models import Crop
 from esi_kinetics.ui import MainWindow
@@ -23,6 +23,31 @@ def test_saved_crop_overlay_uses_coordinates_of_cropped_preview():
     assert window.preview._selection == (0, 0, 60, 60)
     assert window.preview._selection_visible
     assert not window.preview._crop_mode
+    window.close()
+
+
+def test_controls_dropdown_switches_between_new_and_old_controls():
+    window = MainWindow()
+
+    assert window.control_mode.currentText() == "New controls"
+    assert window.control_stack.currentIndex() == 0
+    new_buttons = [button.text() for button in window.control_stack.widget(0).findChildren(QPushButton)]
+    old_buttons = [button.text() for button in window.control_stack.widget(1).findChildren(QPushButton)]
+    assert "Save cropped photo" in new_buttons
+    assert "Reset" in new_buttons
+    assert "Import image folder" in old_buttons
+    assert "Analyze delay folders" in old_buttons
+    assert "Analyze highest-intensity images" in old_buttons
+    assert "Save batch crop" in old_buttons
+    assert "Analyze averaged selected frames" in old_buttons
+    assert "Reset processing" in old_buttons
+    assert "Export results" in old_buttons
+    assert "Average selected frame folders" not in old_buttons
+
+    window.control_mode.setCurrentText("Old controls")
+    assert window.control_stack.currentIndex() == 1
+    window.control_mode.setCurrentText("New controls")
+    assert window.control_stack.currentIndex() == 0
     window.close()
 
 
@@ -198,6 +223,41 @@ def test_final_analysis_requires_both_options_and_exports_averaged_folder(tmp_pa
     assert workbook.is_file()
     assert dialogs == ["folder", "save"]
     assert "1 time delays" in window.summary.text()
+    window.close()
+
+
+def test_saved_folder_analysis_uses_whole_image_path_without_reapplying_edits(tmp_path, monkeypatch):
+    image_folder = tmp_path / "saved photos"
+    image_folder.mkdir()
+    workbook = tmp_path / "analysis.xlsx"
+    captured = {}
+    monkeypatch.setattr(
+        "esi_kinetics.ui.QFileDialog.getExistingDirectory",
+        lambda *args: str(image_folder),
+    )
+    monkeypatch.setattr(
+        "esi_kinetics.ui.QFileDialog.getSaveFileName",
+        lambda *args: (str(workbook), ""),
+    )
+    monkeypatch.setattr(
+        "esi_kinetics.ui.analyze_full_image_intensity",
+        lambda folder: captured.update(folder=folder) or [{"Intensity": 180.0}],
+    )
+    monkeypatch.setattr(
+        "esi_kinetics.ui.export_delay_curve_analysis",
+        lambda rows, output: captured.update(rows=rows, output=output),
+    )
+    monkeypatch.setattr("esi_kinetics.ui.QMessageBox.information", lambda *args: None)
+    window = MainWindow()
+    window.batch_crop = Crop(0, 0, 1, 1)
+    window.reference_background = np.ones((1, 1), dtype=np.float64)
+    window._selected_signal_mask = np.ones((1, 1), dtype=bool)
+
+    window.analyze_saved_cropped_photo_folder()
+
+    assert captured["folder"] == image_folder
+    assert captured["rows"] == [{"Intensity": 180.0}]
+    assert captured["output"] == workbook
     window.close()
 
 

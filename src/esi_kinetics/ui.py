@@ -17,6 +17,7 @@ from .io import (
     analyze_delay_folders,
     analyze_delay_images,
     analyze_delay_images_with_crop,
+    analyze_full_image_intensity,
     average_selected_frame_folders,
     apply_crop_to_folder,
     export_delay_analysis,
@@ -455,6 +456,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
 
     def _build_ui(self) -> None:
+        import_button = QPushButton("Import image folder")
+        import_button.clicked.connect(self.import_folder)
         import_video_button = QPushButton("Import videos (select multiple)")
         import_video_button.clicked.connect(self.import_video)
         self.import_video_button = import_video_button
@@ -464,10 +467,29 @@ class MainWindow(QMainWindow):
         average_selected_frames_button = QPushButton("Average selected frame folders")
         average_selected_frames_button.clicked.connect(self.average_selected_frame_folders)
         self.average_selected_frames_button = average_selected_frames_button
+        old_import_video_button = QPushButton("Import videos (select multiple)")
+        old_import_video_button.clicked.connect(self.import_video)
         self.cropped_image_analysis_button = QPushButton("Analyze averaged selected frames")
         self.cropped_image_analysis_button.clicked.connect(self.analyze_cropped_delay_images)
+        batch_analysis_button = QPushButton("Analyze delay folders")
+        batch_analysis_button.clicked.connect(self.analyze_delay_folders)
+        self.batch_analysis_button = batch_analysis_button
+        selected_image_analysis_button = QPushButton("Analyze highest-intensity images")
+        selected_image_analysis_button.clicked.connect(self.analyze_delay_images)
+        self.selected_image_analysis_button = selected_image_analysis_button
+        save_batch_crop_button = QPushButton("Save batch crop")
+        save_batch_crop_button.clicked.connect(self.save_batch_crop)
+        self.save_batch_crop_button = save_batch_crop_button
+        self.save_profile_button = QPushButton("Save background image")
+        self.save_profile_button.clicked.connect(self.save_profile)
+        self.load_profile_button = QPushButton("Load background image")
+        self.load_profile_button.clicked.connect(self.load_profile)
         reset_button = QPushButton("Reset")
         reset_button.clicked.connect(self.reset)
+        old_reset_button = QPushButton("Reset processing")
+        old_reset_button.clicked.connect(self.reset)
+        export_button = QPushButton("Export results")
+        export_button.clicked.connect(self.export)
         delete_outside_crop_button = QPushButton("Delete outside crop")
         delete_outside_crop_button.clicked.connect(self.delete_outside_crop)
         upload_background_button = QPushButton("Upload background image")
@@ -485,6 +507,34 @@ class MainWindow(QMainWindow):
         controls_layout.addRow("4. Upload background", upload_background_button)
         controls_layout.addRow("5. Save cropped photo", save_cropped_reference_button)
         controls_layout.addRow("6. Analyze saved cropped folder", analyze_saved_folder_button)
+        controls_layout.addRow(reset_button)
+
+        old_controls_layout = QFormLayout()
+        old_controls_layout.addRow(import_button)
+        old_controls_layout.addRow(old_import_video_button)
+        old_controls_layout.addRow(batch_analysis_button)
+        old_controls_layout.addRow(selected_image_analysis_button)
+        old_controls_layout.addRow(save_batch_crop_button)
+        old_controls_layout.addRow(self.cropped_image_analysis_button)
+        old_controls_layout.addRow("Stage", self.stage_selector)
+        old_controls_layout.addRow(self.combine_enabled)
+        old_controls_layout.addRow(self.crop_enabled)
+        old_controls_layout.addRow("Crop x0 / x1", self._pair(self.x0, self.x1))
+        old_controls_layout.addRow("Crop y0 / y1", self._pair(self.y0, self.y1))
+        old_controls_layout.addRow(self.zero_outside_box)
+        old_controls_layout.addRow(self.background_enabled)
+        old_controls_layout.addRow(self.connected_region_enabled)
+        old_controls_layout.addRow(self.scan_segments_enabled)
+        old_controls_layout.addRow("Segment brightness above average", self.segment_offset)
+        old_controls_layout.addRow(self.isolate_segment_enabled)
+        old_controls_layout.addRow(self.use_reference_profile)
+        old_controls_layout.addRow(self._pair(self.save_profile_button, self.load_profile_button))
+        old_controls_layout.addRow("Background mode", self.mode)
+        old_controls_layout.addRow("Threshold", self.threshold)
+        old_controls_layout.addRow("Background value", self.background)
+        old_controls_layout.addRow("Preview contrast", self.contrast)
+        old_controls_layout.addRow(old_reset_button)
+        old_controls_layout.addRow(export_button)
 
         self.crop_enabled.stateChanged.connect(self.crop_mode_changed)
         self.show_crop_overlay.stateChanged.connect(self.update_crop_overlay)
@@ -502,10 +552,27 @@ class MainWindow(QMainWindow):
             widget.valueChanged.connect(self.refresh_preview)
         self.summary.setWordWrap(True)
 
+        new_controls_widget = QWidget()
+        new_controls_widget.setLayout(controls_layout)
+        old_controls_widget = QWidget()
+        old_controls_widget.setLayout(old_controls_layout)
+
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        header_layout.addWidget(QLabel("Controls mode"))
+        header_layout.addWidget(self.control_mode)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        control_stack = QStackedWidget()
+        control_stack.addWidget(new_controls_widget)
+        control_stack.addWidget(old_controls_widget)
+        self.control_stack = control_stack
+        self.control_mode.currentIndexChanged.connect(control_stack.setCurrentIndex)
+
         left = QWidget()
         left_layout = QVBoxLayout(left)
-        left_layout.addLayout(controls_layout)
-        left_layout.addWidget(reset_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        left_layout.addWidget(header)
+        left_layout.addWidget(control_stack)
+        left_layout.addWidget(self.summary)
         left_layout.addStretch(1)
 
         control_scroll = QScrollArea()
@@ -1278,19 +1345,7 @@ class MainWindow(QMainWindow):
         if output_path.suffix.lower() != ".xlsx":
             output_path = output_path.with_suffix(".xlsx")
         try:
-            crop = self.batch_crop
-            candidate_shape = None
-            if self.preview._source_image.size:
-                candidate_shape = self.preview._source_image.shape
-            if crop is not None and candidate_shape is not None:
-                if crop.x1 > candidate_shape[1] or crop.y1 > candidate_shape[0]:
-                    crop = None
-            rows = analyze_delay_images_with_crop(
-                Path(folder),
-                crop=crop,
-                background_reference=self.reference_background,
-                signal_mask=self._selected_signal_mask,
-            ) if (crop is not None or self.reference_background is not None or self._selected_signal_mask is not None) else analyze_delay_images(Path(folder))
+            rows = analyze_full_image_intensity(Path(folder))
             export_delay_curve_analysis(rows, output_path)
             self.summary.setText(f"Saved cropped photo workbook: {output_path.name}")
             QMessageBox.information(
